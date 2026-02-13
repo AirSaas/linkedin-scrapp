@@ -4,9 +4,8 @@ import { unipile } from "./lib/unipile.js";
 import {
   filterProfileViews,
   isACoUrl,
+  parseViewedAgoText,
   sleep,
-  timestampToISODate,
-  timestampToRelativeTime,
   type ProfileView,
 } from "./lib/utils.js";
 
@@ -17,12 +16,20 @@ const RATE_LIMIT = {
   PAUSE_BETWEEN_PROFILES: 3000,
   PAUSE_AFTER_ENRICHMENT: 1500,
   PAUSE_AFTER_429: 5000,
+  PAUSE_BETWEEN_PAGES: 2000,
 };
 
 const MAX_RETRIES = 2;
+const PAGE_SIZE = 10;
 
-const WVMP_URL =
-  "https://www.linkedin.com/voyager/api/identity/wvmpCards";
+/**
+ * GraphQL Voyager URL for paginated profile viewers.
+ * Doc: https://developer.unipile.com/docs/get-raw-data-example#get-own-profile-viewers
+ * Variables: start (offset), count (page size), surfaceType WVMP
+ */
+function buildGraphQLViewersUrl(start: number, count: number): string {
+  return `https://www.linkedin.com/voyager/api/graphql?includeWebMetadata=true&variables=(start:${start},count:${count},query:(),analyticsEntityUrn:(activityUrn:urn%3Ali%3Adummy%3A-1),surfaceType:WVMP)&queryId=voyagerPremiumDashAnalyticsObject.c31102e906e7098910f44e0cecaa5b5c`;
+}
 
 // ============================================
 // TYPES
@@ -131,16 +138,13 @@ async function processProfile(profile: TeamProfile) {
     MAX_RETRIES
   );
 
-  // Trier par viewedAt (plus récent d'abord)
-  allViews.sort((a, b) => (b.viewedAt ?? 0) - (a.viewedAt ?? 0));
-
   // Filtrer (exclure anonymes + > 24h)
   const filtered = filterProfileViews(allViews);
   logger.info(
     `${allViews.length} vues récupérées, ${filtered.length} après filtrage (< 24h, non anonymes)`
   );
 
-  // Enrichir les URLs ACo si nécessaire
+  // Enrichir les URLs ACo → slug propre
   let enrichedCount = 0;
   for (const view of filtered) {
     if (view.profile?.url && isACoUrl(view.profile.url)) {
@@ -169,7 +173,7 @@ async function processProfile(profile: TeamProfile) {
 }
 
 // ============================================
-// RÉCUPÉRATION DES PROFILE VIEWS (UNIPILE)
+// RÉCUPÉRATION DES PROFILE VIEWS (GRAPHQL PAGINÉ)
 // ============================================
 async function getProfileViewsWithRetry(
   accountId: string,
@@ -199,129 +203,117 @@ async function getProfileViewsWithRetry(
 }
 
 /**
- * Fetch profile views via Unipile raw route → LinkedIn Voyager wvmpCards.
+ * Fetch profile views via GraphQL endpoint with pagination.
+ * Doc: https://developer.unipile.com/docs/get-raw-data-example#get-own-profile-viewers
  *
- * Pas de pagination : wvmpCards retourne un dashboard avec ~25 viewers max
- * répartis dans 7 insightCards (Summary, Notable, Company, JobTitle, Source).
- * On parse toutes les cards et on déduplique.
- *
- * TODO: Si Julien (CEO Unipile) ajoute un endpoint natif avec pagination,
- * remplacer cette fonction par un appel direct.
+ * Pagine tant qu'il y a des viewers < 24h sur la page.
+ * S'arrête quand tous les viewers d'une page sont > 24h ou quand la page est vide.
  */
 async function fetchProfileViews(
   accountId: string
 ): Promise<ProfileView[]> {
-  logger.info("Appel raw route wvmpCards...");
+  const allViews: ProfileView[] = [];
+  let start = 0;
+  let hasRecentViewers = true;
 
-  const response = (await unipile.rawRoute(
-    accountId,
-    WVMP_URL
-  )) as any;
+  while (hasRecentViewers) {
+    const url = buildGraphQLViewersUrl(start, PAGE_SIZE);
+    logger.info(`Fetch profile viewers page start=${start}...`);
 
-  return parseWvmpResponse(response);
+    const response = (await unipile.rawRoute(accountId, url, false)) as any;
+    const pageViews = parseGraphQLResponse(response);
+
+    if (pageViews.length === 0) {
+      logger.info(`Page vide à start=${start}, fin de pagination`);
+      break;
+    }
+
+    allViews.push(...pageViews);
+
+    // Vérifier si au moins un viewer est < 24h sur cette page
+    const hasAnyRecent = pageViews.some(
+      (v) => v.ageInHours !== undefined && v.ageInHours <= 24
+    );
+
+    if (!hasAnyRecent) {
+      logger.info(
+        `Plus aucun viewer < 24h à start=${start}, fin de pagination`
+      );
+      hasRecentViewers = false;
+    } else {
+      start += PAGE_SIZE;
+      await sleep(RATE_LIMIT.PAUSE_BETWEEN_PAGES);
+    }
+  }
+
+  logger.info(`Total: ${allViews.length} viewers récupérés`);
+  return allViews;
 }
 
 /**
- * Parse la réponse Voyager wvmpCards.
- * Itère sur toutes les insightCards, extrait les viewers, déduplique par publicIdentifier.
+ * Parse la réponse GraphQL profile viewers.
+ * Path: data.data.premiumDashAnalyticsObjectByAnalyticsEntity.elements[]
  */
-function parseWvmpResponse(response: any): ProfileView[] {
+function parseGraphQLResponse(response: any): ProfileView[] {
   try {
-    const elements = response?.data?.elements;
+    const elements =
+      response?.data?.data?.premiumDashAnalyticsObjectByAnalyticsEntity
+        ?.elements;
     if (!elements?.length) {
-      logger.warn("Réponse wvmpCards vide (pas d'elements)");
       return [];
     }
 
-    // Naviguer vers la WvmpViewersCard
-    const firstElement = elements[0]?.value;
-    if (!firstElement) return [];
+    const views: ProfileView[] = [];
 
-    const viewersCardKey = Object.keys(firstElement).find((k) =>
-      k.includes("WvmpViewersCard")
-    );
-    if (!viewersCardKey) {
-      logger.warn("WvmpViewersCard non trouvée dans la réponse");
-      return [];
+    for (const element of elements) {
+      const lockup =
+        element?.content?.analyticsEntityLockup?.entityLockup;
+      if (!lockup) continue; // Skip promo/upsell slots
+
+      const navigationUrl: string | undefined = lockup.navigationUrl;
+      if (!navigationUrl) continue;
+
+      // Skip semi-anonymous viewers ("Someone at Company" → URL vers /search/)
+      if (navigationUrl.includes("/search/")) continue;
+
+      // Skip si ce n'est pas un profil LinkedIn
+      if (!navigationUrl.includes("/in/")) continue;
+
+      const titleText: string = lockup.title?.text ?? "";
+      const subtitleText: string = lockup.subtitle?.text ?? "";
+      const captionText: string = lockup.caption?.text ?? "";
+
+      // Parse "Viewed 5h ago" → { hours: 5, relativeText: "5 hours" }
+      const parsed = parseViewedAgoText(captionText);
+
+      // Extraire l'identifiant ACo depuis l'URL
+      const acoMatch = navigationUrl.match(/\/in\/([^/?]+)/);
+      const acoId = acoMatch?.[1];
+      if (!acoId) continue;
+
+      const profileUrl = `https://www.linkedin.com/in/${acoId}`;
+
+      views.push({
+        ageInHours: parsed?.hours,
+        last_viewed_time: parsed?.relativeText,
+        calculated_date: parsed
+          ? new Date(Date.now() - parsed.hours * 3600000)
+              .toISOString()
+              .substring(0, 10)
+          : undefined,
+        profile: {
+          id: acoId,
+          full_name: titleText,
+          url: profileUrl,
+          headline: subtitleText,
+        },
+      });
     }
 
-    const insightCards = firstElement[viewersCardKey]?.insightCards ?? [];
-    logger.info(`${insightCards.length} insightCards trouvées`);
-
-    // Collecter tous les viewers uniques
-    const viewerMap = new Map<string, ProfileView>();
-
-    for (const insightCard of insightCards) {
-      const cardValue = insightCard?.value;
-      if (!cardValue) continue;
-
-      const cardTypeKey = Object.keys(cardValue)[0];
-      const cardData = cardValue[cardTypeKey];
-      const cards = cardData?.cards ?? [];
-
-      for (const card of cards) {
-        const profileCardValue = card?.value;
-        if (!profileCardValue) continue;
-
-        const profileCardKey = Object.keys(profileCardValue)[0];
-        const profileCard = profileCardValue[profileCardKey];
-
-        const viewedAt: number | undefined = profileCard?.viewedAt;
-        const viewer = profileCard?.viewer;
-        if (!viewer) continue;
-
-        const viewerTypeKey = Object.keys(viewer)[0];
-
-        // Skip anonymous/obfuscated viewers
-        if (viewerTypeKey.includes("Obfuscated")) continue;
-
-        const viewerData = viewer[viewerTypeKey];
-        const miniProfile =
-          viewerData?.profile?.miniProfile ?? viewerData?.miniProfile;
-        if (!miniProfile) continue;
-
-        const publicIdentifier: string | undefined =
-          miniProfile.publicIdentifier;
-        if (!publicIdentifier) continue;
-
-        // Dédupliquer : garder le viewedAt le plus récent
-        const existing = viewerMap.get(publicIdentifier);
-        if (existing && existing.viewedAt && viewedAt && existing.viewedAt >= viewedAt) {
-          continue;
-        }
-
-        const url = `https://www.linkedin.com/in/${publicIdentifier}`;
-        const fullName = [miniProfile.firstName, miniProfile.lastName]
-          .filter(Boolean)
-          .join(" ");
-
-        viewerMap.set(publicIdentifier, {
-          viewedAt,
-          last_viewed_time: viewedAt
-            ? timestampToRelativeTime(viewedAt)
-            : undefined,
-          calculated_date: viewedAt
-            ? timestampToISODate(viewedAt)
-            : undefined,
-          profile: {
-            id: publicIdentifier,
-            full_name: fullName,
-            url,
-            headline: miniProfile.occupation ?? "",
-          },
-        });
-      }
-    }
-
-    const viewers = Array.from(viewerMap.values());
-    logger.info(
-      `${viewers.length} viewers uniques extraits de toutes les insightCards`
-    );
-    return viewers;
+    return views;
   } catch (err) {
-    logger.error("Erreur parsing wvmpCards", {
+    logger.error("Erreur parsing GraphQL profile viewers", {
       error: err instanceof Error ? err.message : String(err),
-      response: JSON.stringify(response).substring(0, 500),
     });
     return [];
   }
@@ -348,14 +340,17 @@ async function enrichContactUrl(
 
   // 2. Appel API Unipile pour résoudre l'URL
   try {
-    logger.debug(`Enrichissement API: ${originalUrl}`);
-    const userData = (await unipile.getUser(originalUrl, accountId)) as any;
+    // Extraire l'identifiant ACo depuis l'URL
+    const acoMatch = originalUrl.match(/\/in\/([^/?]+)/);
+    const identifier = acoMatch?.[1] ?? originalUrl;
 
-    const enrichedUrl =
-      userData?.public_profile_url ??
-      (userData?.provider_id
-        ? `https://www.linkedin.com/in/${userData.provider_id}`
-        : null);
+    logger.debug(`Enrichissement API: ${identifier}`);
+    const userData = (await unipile.getUser(identifier, accountId)) as any;
+
+    const slug = userData?.public_identifier;
+    const enrichedUrl = slug
+      ? `https://www.linkedin.com/in/${slug}`
+      : null;
 
     if (enrichedUrl && enrichedUrl !== originalUrl) {
       await supabase.from("enriched_contacts").upsert(

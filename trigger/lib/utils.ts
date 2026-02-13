@@ -51,28 +51,39 @@ export function isACoUrl(url: string): boolean {
 }
 
 /**
- * Convert a Unix timestamp (ms) to a relative time string ("2 hours", "30 minutes").
+ * Parse a "Viewed Xh ago" / "Viewed Xm ago" / "Viewed Xd ago" caption
+ * into hours (number) and a relative text for date_scrapped.
+ * Returns null if not parseable.
  */
-export function timestampToRelativeTime(viewedAtMs: number): string {
-  const diffMs = Date.now() - viewedAtMs;
-  const hours = Math.floor(diffMs / (1000 * 60 * 60));
-  const minutes = Math.floor(diffMs / (1000 * 60));
-  if (hours >= 1) return `${hours} hours`;
-  return `${minutes} minutes`;
+export function parseViewedAgoText(
+  caption: string
+): { hours: number; relativeText: string } | null {
+  if (!caption) return null;
+  const match = caption.match(/Viewed\s+(\d+)([mhdw])\s+ago/i);
+  if (!match) return null;
+
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+
+  switch (unit) {
+    case "m":
+      return { hours: value / 60, relativeText: `${value} minutes` };
+    case "h":
+      return { hours: value, relativeText: `${value} hours` };
+    case "d":
+      return { hours: value * 24, relativeText: `${value} days` };
+    case "w":
+      return { hours: value * 24 * 7, relativeText: `${value * 7} days` };
+    default:
+      return null;
+  }
 }
 
 /**
- * Convert a Unix timestamp (ms) to an ISO date string "YYYY-MM-DD".
- */
-export function timestampToISODate(viewedAtMs: number): string {
-  return new Date(viewedAtMs).toISOString().substring(0, 10);
-}
-
-/**
- * Profile view as normalized from the Voyager wvmpCards response.
+ * Profile view normalized from the GraphQL profile viewers response.
  */
 export interface ProfileView {
-  viewedAt?: number;
+  ageInHours?: number;
   last_viewed_time?: string;
   profile?: {
     id?: string;
@@ -84,15 +95,13 @@ export interface ProfileView {
 }
 
 /**
- * Filter profile views: exclude anonymous (no profile.id) and views older than 24h.
+ * Filter profile views: exclude those without profile/id and views older than 24h.
  */
 export function filterProfileViews(views: ProfileView[]): ProfileView[] {
-  const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
-
   return views.filter((view) => {
     if (!view.profile) return false;
     if (!view.profile.id) return false;
-    if (view.viewedAt && view.viewedAt < twentyFourHoursAgo) return false;
+    if (view.ageInHours !== undefined && view.ageInHours > 24) return false;
     return true;
   });
 }
