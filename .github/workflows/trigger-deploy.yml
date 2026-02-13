@@ -1,9 +1,10 @@
-name: Deploy to Trigger.dev (prod)
+name: Deploy to Trigger.dev
 
 on:
   push:
     branches:
       - main
+      - staging
 
 jobs:
   deploy:
