@@ -62,11 +62,12 @@ export const unipile = {
    * POST /linkedin with { account_id, request_url, method }
    * request_url must be a full URL: https://www.linkedin.com/voyager/api/...
    */
-  rawRoute: (accountId: string, requestUrl: string) =>
+  rawRoute: (accountId: string, requestUrl: string, encoding?: boolean) =>
     request("POST", "/linkedin", {
       account_id: accountId,
       request_url: requestUrl,
       method: "GET",
+      ...(encoding !== undefined && { encoding }),
     }),
 
   /**
