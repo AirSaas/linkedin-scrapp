@@ -1,8 +1,5 @@
 import { logger } from "@trigger.dev/sdk/v3";
 
-const UNIPILE_BASE_URL = process.env.UNIPILE_BASE_URL!;
-const UNIPILE_API_KEY = process.env.UNIPILE_API_KEY!;
-
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 5000;
 
@@ -15,7 +12,7 @@ async function request(
   path: string,
   body?: unknown
 ): Promise<unknown> {
-  const url = `${UNIPILE_BASE_URL}${path}`;
+  const url = `${process.env.UNIPILE_BASE_URL!}${path}`;
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -27,7 +24,7 @@ async function request(
     const res = await fetch(url, {
       method,
       headers: {
-        "X-API-KEY": UNIPILE_API_KEY,
+        "X-API-KEY": process.env.UNIPILE_API_KEY!,
         "Content-Type": "application/json",
         Accept: "application/json",
       },
