@@ -83,4 +83,16 @@ export const unipile = {
    */
   search: (accountId: string, body: Record<string, unknown>) =>
     request("POST", `/linkedin/search?account_id=${accountId}`, body),
+
+  /**
+   * Get user relations (1st-degree connections).
+   * GET /users/relations?account_id={accountId}&limit={limit}&cursor={cursor}
+   * Returns UserRelationsList with items sorted by created_at desc.
+   */
+  getRelations: (accountId: string, limit?: number, cursor?: string) => {
+    let path = `/users/relations?account_id=${accountId}`;
+    if (limit) path += `&limit=${limit}`;
+    if (cursor) path += `&cursor=${cursor}`;
+    return request("GET", path);
+  },
 };

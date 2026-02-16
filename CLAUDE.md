@@ -12,7 +12,9 @@
 
 - `trigger/get-profil-views.ts` — scrapes LinkedIn profile viewers via GraphQL Voyager endpoint
 - `trigger/get-strategic-connections.ts` — scrapes Sales Navigator saved searches for new concurrent profiles
-- `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search)
+- `trigger/get-strategic-people.ts` — scrapes Sales Navigator saved searches for strategic people (CIO, PMO, etc.)
+- `trigger/get-team-connections.ts` — fetches 1st-degree LinkedIn connections for all team members
+- `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
 
@@ -36,6 +38,17 @@
 - Maps `ghost_genius_account_id` → `unipile_account_id`
 - Contains LinkedIn URLs and team member info
 
+### `scrapped_connection`
+- 1st-degree LinkedIn connections (from `get-team-connections`)
+- PK composite: `(profil_linkedin_url_connection, linkedin_url_owner_post)`
+- `created_at`: scraping date (YYYY-MM-DD), `connected_at`: connection date
+- `contact_urn`: LinkedIn member ID (ACoAA... format)
+- ⚠️ URLs stored without trailing `/`
+
+### `new_scrapp_strategic_people_salesnav`
+- Strategic people from Sales Navigator (from `get-strategic-people`)
+- PK composite: `(linkedin_private_url, saved_search_name)`
+
 ### `enriched_contacts`
 - Cache for ACo URL → enriched slug resolution
 
@@ -44,3 +57,4 @@
 - **Search**: `POST /linkedin/search?account_id=X` with `{ url: "...savedSearchId=...&lastViewedAt=<timestamp_ms>" }` — cursor-based pagination, 10 items/page. `lastViewedAt` is a native Sales Navigator URL parameter that filters to only new results since that timestamp.
 - **Raw route**: `POST /linkedin` — proxy to LinkedIn Voyager GraphQL
 - **Get user**: `GET /users/{identifier}?account_id=X`
+- **Get relations**: `GET /users/relations?account_id=X&limit=N&cursor=C` — returns `UserRelationsList` with items sorted by `created_at` desc. Each `UserRelation` has `first_name`, `last_name`, `headline`, `public_profile_url` (trailing `/`), `member_id` (ACoAA...), `created_at` (timestamp ms)
