@@ -76,4 +76,11 @@ export const unipile = {
       "GET",
       `/users/${encodeURIComponent(identifier)}?account_id=${accountId}`
     ),
+
+  /**
+   * Search LinkedIn (Sales Navigator saved searches, etc.).
+   * POST /linkedin/search?account_id={accountId}
+   */
+  search: (accountId: string, body: Record<string, unknown>) =>
+    request("POST", `/linkedin/search?account_id=${accountId}`, body),
 };
