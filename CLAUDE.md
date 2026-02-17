@@ -14,6 +14,7 @@
 - `trigger/get-strategic-connections.ts` — scrapes Sales Navigator saved searches for new concurrent profiles
 - `trigger/get-strategic-people.ts` — scrapes Sales Navigator saved searches for strategic people (CIO, PMO, etc.)
 - `trigger/get-team-connections.ts` — fetches 1st-degree LinkedIn connections for all team members
+- `trigger/lgm-process-intent-events.ts` — processes J-1 intent events + concurrent contacts → routes to LGM or HubSpot, sends grouped Slack recap
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
@@ -51,6 +52,20 @@
 
 ### `enriched_contacts`
 - Cache for ACo URL → enriched slug resolution
+
+### `PRC_INTENT_EVENTS`
+- Intent events (reactions, comments, visits, follows) from `lgm-process-intent-events`
+- Read-only: filtered on `EVENT_RECORDED_ON` J-1, `CONTACT_JOB_STRATEGIC_ROLE` non null
+- Fields: `CONTACT_FIRST_NAME`, `CONTACT_LAST_NAME`, `CONTACT_LINKEDIN_PROFILE_URL`, `COMPANY_NAME`, `CONTACT_JOB`, `CONTACT_HUBSPOT_ID`, `BUSINESS_OWNER`, `INTENT_EVENT_TYPE`, `CONNECTED_WITH_BUSINESS_OWNER`
+
+### `PRC_CONTACTS`
+- Read-only: lookup `CONTACT_HUBSPOT_ID` by `CONTACT_LINKEDIN_PROFILE_URL`
+- Used by `lgm-process-intent-events` for concurrent contacts HubSpot routing
+
+## External APIs (non-Unipile)
+
+- **LGM (LaGrowthMachine)**: `POST https://apiv2.lagrowthmachine.com/flow/leads?apikey=X` — send leads with audience name. Env var: `LGM_API_KEY`
+- **HubSpot**: `GET/PATCH/POST https://api.hubapi.com/crm/v3/objects/contacts` — manage contacts, `agent_ia_activated` property. Env var: `HUBSPOT_ACCESS_TOKEN`
 
 ## Unipile API
 
