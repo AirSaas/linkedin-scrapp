@@ -16,7 +16,8 @@
 - `trigger/get-team-connections.ts` — fetches 1st-degree LinkedIn connections for all team members
 - `trigger/lgm-process-intent-events.ts` — processes J-1 intent events + concurrent contacts → routes to LGM or HubSpot, sends grouped Slack recap
 - `trigger/hubspot-cleanup-email-associations.ts` — removes parasitic email-contact associations in HubSpot (emails with >3 contacts where contact not in from/to/cc/bcc)
-- `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations)
+- `trigger/import-linkedin-messages.ts` — imports LinkedIn messages from last 24h via Unipile → Supabase, sends 1:1 messages to HubSpot (communication) + Zapier webhook
+- `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
 
@@ -63,6 +64,25 @@
 - Read-only: lookup `CONTACT_HUBSPOT_ID` by `CONTACT_LINKEDIN_PROFILE_URL`
 - Used by `lgm-process-intent-events` for concurrent contacts HubSpot routing
 
+### `scrapped_linkedin_threads`
+- LinkedIn messaging threads (from `import-linkedin-messages`)
+- PK: `id` (LinkedIn thread ID, format `2-base64...`)
+- `last_activity_at`: ISO timestamp, `is_read`: boolean
+- `participants`: JSON array in Ghost Genius format (`{id, type, full_name, url, profile_picture}`)
+- `participant_owner_id`: team member's `linkedin_urn` (ACoAA...)
+- `participants_ids`: array of all participant URNs, `participants_numbers`: count
+- `main_participant_id`: other participant URN for 1:1 threads
+
+### `scrapped_linkedin_messages`
+- LinkedIn messages (from `import-linkedin-messages`)
+- PK: `id` (format `urn:li:msg_message:(urn:li:fsd_profile:${owner_urn},${msg_provider_id})`)
+- `thread_id`: references `scrapped_linkedin_threads.id`
+- `message_date`: ISO timestamp, `is_read`: boolean, `text`: message content
+- `sender_id`: sender's LinkedIn URN (ACoAA...)
+- `sender_data`: JSON in Ghost Genius format (`{id, type, full_name, url, profile_picture}`)
+- `hubspot_communication_id`: HubSpot communication ID (set after HubSpot sync for 1:1 threads)
+- `participant_owner_id`, `participants_numbers`, `main_participant_id`: denormalized from thread
+
 ## External APIs (non-Unipile)
 
 - **LGM (LaGrowthMachine)**: `POST https://apiv2.lagrowthmachine.com/flow/leads?apikey=X` — send leads with audience name. Env var: `LGM_API_KEY`
@@ -74,3 +94,6 @@
 - **Raw route**: `POST /linkedin` — proxy to LinkedIn Voyager GraphQL
 - **Get user**: `GET /users/{identifier}?account_id=X`
 - **Get relations**: `GET /users/relations?account_id=X&limit=N&cursor=C` — returns `UserRelationsList` with items sorted by `created_at` desc. Each `UserRelation` has `first_name`, `last_name`, `headline`, `public_profile_url` (trailing `/`), `member_id` (ACoAA...), `created_at` (timestamp ms)
+- **Get chats**: `GET /chats?account_id=X&limit=N&after=ISO&cursor=C` — list messaging threads, cursor-based pagination. `after` filters by activity date.
+- **Get chat messages**: `GET /chats/{chatId}/messages?limit=N&cursor=C` — messages for a thread, cursor-based pagination
+- **Get chat attendees**: `GET /chats/{chatId}/attendees` — participants of a thread (only returns non-self, `is_self: 0`)

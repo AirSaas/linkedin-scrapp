@@ -95,4 +95,42 @@ export const unipile = {
     if (cursor) path += `&cursor=${cursor}`;
     return request("GET", path);
   },
+
+  /**
+   * List chats (messaging threads).
+   * GET /chats?account_id={accountId}&limit={limit}&after={after}&cursor={cursor}
+   * `after` is an ISO date string to filter chats with activity since that date.
+   */
+  getChats: (
+    accountId: string,
+    limit?: number,
+    after?: string,
+    cursor?: string
+  ) => {
+    let path = `/chats?account_id=${accountId}`;
+    if (limit) path += `&limit=${limit}`;
+    if (after) path += `&after=${after}`;
+    if (cursor) path += `&cursor=${cursor}`;
+    return request("GET", path);
+  },
+
+  /**
+   * Get messages for a specific chat.
+   * GET /chats/{chatId}/messages?limit={limit}&cursor={cursor}
+   */
+  getChatMessages: (chatId: string, limit?: number, cursor?: string) => {
+    let path = `/chats/${chatId}/messages`;
+    const params: string[] = [];
+    if (limit) params.push(`limit=${limit}`);
+    if (cursor) params.push(`cursor=${cursor}`);
+    if (params.length > 0) path += `?${params.join("&")}`;
+    return request("GET", path);
+  },
+
+  /**
+   * Get attendees (participants) of a chat.
+   * GET /chats/{chatId}/attendees
+   */
+  getChatAttendees: (chatId: string) =>
+    request("GET", `/chats/${chatId}/attendees`),
 };
