@@ -7,6 +7,16 @@
 - **Project ref**: `proj_qnvzrrduyvfunicemipq`
 - **Env vars**: configured in Trigger.dev dashboard (not in code), per environment
 - **Cron**: configured via Trigger.dev dashboard (not in code)
+- **Secret key (prod)**: `tr_prod_TOBy4NubZXOQASLQDR2n` — used for Management API auth
+
+## Trigger.dev Management API
+
+Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key>`.
+
+- **List env vars**: `GET /api/v1/projects/proj_qnvzrrduyvfunicemipq/envvars`
+- **Create env var**: `POST /api/v1/projects/proj_qnvzrrduyvfunicemipq/envvars/{env}` with `{"name":"VAR_NAME","value":"value"}` (env = `dev`, `staging`, or `prod`)
+- **List runs**: `GET /api/v1/runs?filter[status]=FAILED&page[size]=10`
+- **Get run details**: `GET /api/v3/runs/{runId}` (includes `error` field with name, message, stackTrace)
 
 ## Key Files
 

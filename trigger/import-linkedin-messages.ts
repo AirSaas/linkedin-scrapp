@@ -640,6 +640,7 @@ async function sendToZapier(
   const receiverInfo = participants.find((p) => p.id === receiverId);
 
   const enrichedMessage = {
+    source: "trigger.dev",
     id: messageRecord.id,
     thread_id: messageRecord.thread_id,
     message_date: messageRecord.message_date,

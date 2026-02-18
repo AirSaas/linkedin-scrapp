@@ -1019,7 +1019,7 @@ async function sendGroupedSlackMessage(
   }
 
   // Build message
-  let message = "🔔 *Intent Events J-1*\n";
+  let message = "🔔 *Intent Events J-1 — Trigger.dev*\n";
 
   if (errorCount > 0) {
     message += `⚠️ ${errorCount} error${errorCount > 1 ? "s" : ""} → see details in <#${SLACK_CHANNEL_LOGERROR_ID}|script-logs>\n`;
@@ -1141,7 +1141,7 @@ async function sendSlackErrorAlert(
     return;
   }
 
-  let message = `🚨 *Alerte Intent Events Script*
+  let message = `🚨 *Alerte Intent Events Script — Trigger.dev*
 
 ⚠️ Des erreurs sont survenues lors du traitement :
 

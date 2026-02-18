@@ -377,7 +377,7 @@ async function sendSlackErrorReport(
   const dateStr = now.toISOString().substring(0, 10);
   const timeStr = now.toISOString().substring(11, 16);
 
-  let message = `[Strategic People SalesNav] ⚠️ Erreurs — ${dateStr} ${timeStr}\n\n`;
+  let message = `[Strategic People SalesNav — Trigger.dev] ⚠️ Erreurs — ${dateStr} ${timeStr}\n\n`;
 
   message += "📊 Résultats\n";
   for (const [key, stats] of Object.entries(resultsBySearch)) {

@@ -299,10 +299,10 @@ function buildSlackMessage(
   const ownerIds = Object.keys(groupedByOwnerAndRule);
 
   if (ownerIds.length === 0) {
-    return "🎉 *Félicitations à tous !* Pas de deal à nettoyer 🙂\n\nTous les deals sont en ordre. Bravo pour la rigueur ! 💪";
+    return "🎉 *Félicitations à tous !* Pas de deal à nettoyer — Trigger.dev 🙂\n\nTous les deals sont en ordre. Bravo pour la rigueur ! 💪";
   }
 
-  let message = "🚨 *Deals à nettoyer*\n\n";
+  let message = "🚨 *Deals à nettoyer — Trigger.dev*\n\n";
 
   for (const ownerId of ownerIds) {
     const ruleDeals = groupedByOwnerAndRule[ownerId];

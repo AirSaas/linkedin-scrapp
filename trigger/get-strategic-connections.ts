@@ -399,7 +399,7 @@ async function sendSlackErrorReport(
   const dateStr = now.toISOString().substring(0, 10);
   const timeStr = now.toISOString().substring(11, 16);
 
-  let message = `[Scrapp LinkedIn Concurrent] ⚠️ Erreurs — ${dateStr} ${timeStr}\n\n`;
+  let message = `[Scrapp LinkedIn Concurrent — Trigger.dev] ⚠️ Erreurs — ${dateStr} ${timeStr}\n\n`;
 
   message += "📊 Résultats\n";
   for (const [key, stats] of Object.entries(resultsByConfig)) {

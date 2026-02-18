@@ -120,6 +120,26 @@ export const getProfilViewsTask = schedules.task({
       totalEnriched,
     };
 
+    // Send success recap webhook
+    const successWebhook = process.env.webhook_succes_profil_view ?? "";
+    if (successWebhook) {
+      const now = new Date();
+      const dateStr = now.toISOString().substring(0, 10);
+      const timeStr = now.toISOString().substring(11, 16);
+      const text = `[Profile Views — Trigger.dev] ✅ — ${dateStr} ${timeStr}\n• ${teamProfiles.length} profils traités, ${totalInserted} visites insérées, ${totalEnriched} enrichies`;
+      try {
+        await fetch(successWebhook, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+      } catch (err) {
+        logger.warn("Failed to send success webhook", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     logger.info("=== RÉSUMÉ ===", summary);
     return summary;
   },
