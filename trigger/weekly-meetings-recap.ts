@@ -105,7 +105,7 @@ export const weeklyMeetingsRecapTask = schedules.task({
 
     if (meetings.length === 0) {
       await sendSlackMessage(
-        `<!channel>\nAucun meeting SQL cette semaine 🏖️\n\n_${weekLabel}_`
+        `<!channel>\nAucun meeting SQL cette semaine 🏖️ — Trigger.dev\n\n_${weekLabel}_`
       );
       logger.info("No meetings, sent empty recap");
       return { success: true, meetings: 0 };
@@ -119,7 +119,7 @@ export const weeklyMeetingsRecapTask = schedules.task({
 
     if (meetingsWithDeals.length === 0) {
       await sendSlackMessage(
-        `<!channel>\nAucun meeting SQL cette semaine 🏖️\n\n_${weekLabel}_`
+        `<!channel>\nAucun meeting SQL cette semaine 🏖️ — Trigger.dev\n\n_${weekLabel}_`
       );
       logger.info("No SQL pipeline meetings, sent empty recap");
       return { success: true, meetings: 0 };
@@ -626,7 +626,7 @@ const SYSTEM_PROMPT = `Tu es un assistant commercial qui produit des récaps heb
 Tu reçois un JSON structuré avec les meetings de la semaine groupés par jour.
 
 Produis un message Slack bien formaté avec :
-1. Un titre avec la semaine concernée
+1. Un titre avec la semaine concernée, suivi de "— Trigger.dev"
 2. Pour chaque jour (lundi à vendredi) :
    - Liste des meetings avec : heure, entreprise, nom du deal, stage, montant (ou "non renseigné"), owner entre parenthèses
    - Total du jour
@@ -713,7 +713,7 @@ function formatAmount(amount: number): string {
 
 function buildStaticRecap(weekData: WeekData): string {
   const lines: string[] = [];
-  lines.push(`📅 *Récap meetings SQL — ${weekData.weekLabel}*\n`);
+  lines.push(`📅 *Récap meetings SQL — ${weekData.weekLabel} — Trigger.dev*\n`);
 
   for (const day of weekData.days) {
     lines.push(`*${day.dayLabel}*`);

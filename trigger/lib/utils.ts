@@ -145,7 +145,7 @@ export async function sendErrorToScriptLogs(
   const dateStr = now.toISOString().substring(0, 10);
   const timeStr = now.toISOString().substring(11, 16);
 
-  let message = `[${taskName}] ⚠️ Erreurs — ${dateStr} ${timeStr}\n`;
+  let message = `[${taskName} — Trigger.dev] ⚠️ Erreurs — ${dateStr} ${timeStr}\n`;
 
   // Results section
   message += `\n📊 Résultats\n`;

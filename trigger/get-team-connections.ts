@@ -316,7 +316,7 @@ async function sendSlackErrorReport(
   const dateStr = now.toISOString().substring(0, 10);
   const timeStr = now.toISOString().substring(11, 16);
 
-  let message = `[Team Connections] ⚠️ Erreurs — ${dateStr} ${timeStr}\n\n`;
+  let message = `[Team Connections — Trigger.dev] ⚠️ Erreurs — ${dateStr} ${timeStr}\n\n`;
 
   message += "📊 Résultats\n";
   for (const [ownerUrl, stats] of Object.entries(resultsByMember)) {
