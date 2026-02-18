@@ -6,7 +6,9 @@ import {
   isACoUrl,
   parseViewedAgoText,
   sleep,
+  sendErrorToScriptLogs,
   type ProfileView,
+  type TaskError,
 } from "./lib/utils.js";
 
 // ============================================
@@ -65,6 +67,7 @@ export const getProfilViewsTask = schedules.task({
     let failureCount = 0;
     let totalInserted = 0;
     let totalEnriched = 0;
+    const errors: TaskError[] = [];
 
     for (let i = 0; i < teamProfiles.length; i++) {
       const profile = teamProfiles[i];
@@ -82,8 +85,15 @@ export const getProfilViewsTask = schedules.task({
         );
       } catch (err) {
         failureCount++;
+        const msg = err instanceof Error ? err.message : String(err);
         logger.error(`Échec profil ${profile.linkedin_url_owner_post}`, {
-          error: err instanceof Error ? err.message : String(err),
+          error: msg,
+        });
+        errors.push({
+          type: "Processing",
+          code: "exception",
+          message: msg,
+          profile: profile.linkedin_url_owner_post,
         });
       }
 
@@ -92,6 +102,14 @@ export const getProfilViewsTask = schedules.task({
         await sleep(RATE_LIMIT.PAUSE_BETWEEN_PROFILES);
       }
     }
+
+    // Send error recap to #script-logs
+    await sendErrorToScriptLogs("Profile Views", [{
+      label: "Profils d'équipe",
+      inserted: totalInserted,
+      skipped: teamProfiles.length - successCount - failureCount,
+      errors,
+    }]);
 
     const summary = {
       success: successCount > 0,

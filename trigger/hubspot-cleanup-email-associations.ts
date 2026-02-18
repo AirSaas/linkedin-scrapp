@@ -1,5 +1,5 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
-import { sleep } from "./lib/utils.js";
+import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
 
 // ============================================
 // CONFIGURATION
@@ -59,7 +59,7 @@ export const hubspotCleanupEmailAssociationsTask = schedules.task({
 
     let emailsWithIssues = 0;
     let associationsRemoved = 0;
-    let errors = 0;
+    const errorDetails: TaskError[] = [];
 
     // 2. Process each email
     for (const email of emails) {
@@ -126,7 +126,12 @@ export const hubspotCleanupEmailAssociationsTask = schedules.task({
             logger.error(
               `Error removing association ${contact.id}: ${msg}`
             );
-            errors++;
+            errorDetails.push({
+              type: "Remove Association",
+              code: "exception",
+              message: msg,
+              profile: `email:${emailId} contact:${contact.id}`,
+            });
             continue;
           }
 
@@ -146,12 +151,20 @@ export const hubspotCleanupEmailAssociationsTask = schedules.task({
       }
     }
 
+    // Send error recap to #script-logs
+    await sendErrorToScriptLogs("HubSpot Cleanup Email Associations", [{
+      label: "Associations",
+      inserted: associationsRemoved,
+      skipped: emails.length - emailsWithIssues,
+      errors: errorDetails,
+    }]);
+
     const summary = {
       success: true,
       emailsScanned: emails.length,
       emailsWithIssues,
       associationsRemoved,
-      errors,
+      errors: errorDetails.length,
     };
 
     logger.info("=== SUMMARY ===", summary);

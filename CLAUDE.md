@@ -28,6 +28,21 @@
 - **Edge Function `/functions/v1/enrich`**: This is the enrichment function hosted on Supabase. **Never reinvent or replace it.** Always call it as-is with `{ parameter: "all", contact_linkedin_url: "http://linkedin.com/in/{id}" }`.
 - **Lazy initialization**: Supabase and Unipile clients must NOT initialize at import time (env vars unavailable during Trigger.dev Docker build). Use lazy-init patterns.
 - **Ghost Genius account IDs**: Still used as keys in `workspace_team` to look up `unipile_account_id`. The Ghost Genius API itself is no longer used.
+- **Error reporting sur Slack** : Toute task Trigger.dev doit envoyer un recap d'erreur sur le webhook `script_logs` quand il y a des erreurs, via `sendErrorToScriptLogs()` de `trigger/lib/utils.ts`. Le message doit identifier clairement la task et être lisible d'un coup d'oeil. Exemple de bon message :
+  ```
+  [Strategic People SalesNav] ⚠️ Erreurs — 2026-02-18 14:30
+
+  📊 Résultats
+  • CIO - DSI France: 5 insérés | 0 ignorés
+  • PMO France: 3 insérés | 1 ignoré
+
+  ❌ Erreurs (3)
+  • CIO - DSI France: 1x Enrichissement (404), 1x Supabase Upsert (23505)
+  • PMO France: 1x Enrichissement (timeout)
+
+  Total: 3 erreurs
+  ```
+  Les webhooks d'activité existants (recap succès, notifications métier) sont séparés et ne remplacent pas cette alerte erreur.
 
 ## Supabase Tables
 

@@ -1,7 +1,7 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { supabase } from "./lib/supabase.js";
 import { unipile } from "./lib/unipile.js";
-import { sleep } from "./lib/utils.js";
+import { sleep, sendErrorToScriptLogs, type TaskResultGroup } from "./lib/utils.js";
 
 // ============================================
 // CONFIGURATION
@@ -112,6 +112,17 @@ export const getStrategicConnectionsTask = schedules.task({
     }
 
     await sendSlackErrorReport(resultsByConfig);
+
+    // Send error recap to #script-logs
+    const scriptLogGroups: TaskResultGroup[] = Object.entries(resultsByConfig).map(
+      ([key, stats]) => ({
+        label: SALES_NAV_CONFIGS.find((c) => c.key === key)?.description ?? key,
+        inserted: stats.inserted,
+        skipped: stats.skipped,
+        errors: stats.errors,
+      })
+    );
+    await sendErrorToScriptLogs("Scrapp LinkedIn Concurrent", scriptLogGroups);
 
     const summary = {
       success: totalInserted >= 0,

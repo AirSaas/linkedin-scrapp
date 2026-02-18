@@ -1,6 +1,6 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import Anthropic from "@anthropic-ai/sdk";
-import { sleep } from "./lib/utils.js";
+import { sleep, sendErrorToScriptLogs } from "./lib/utils.js";
 
 // ============================================
 // CONFIGURATION
@@ -93,6 +93,7 @@ export const weeklyMeetingsRecapTask = schedules.task({
   maxDuration: 300,
   run: async () => {
     logger.info("=== START weekly-meetings-recap ===");
+    try {
 
     // Step 1 — Calculate week boundaries (Europe/Paris)
     const { mondayMs, fridayMs, weekLabel, dayDates } = getWeekBounds();
@@ -158,6 +159,18 @@ export const weeklyMeetingsRecapTask = schedules.task({
     };
     logger.info("=== SUMMARY ===", summary);
     return summary;
+
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`Fatal error: ${msg}`);
+      await sendErrorToScriptLogs("Weekly Meetings Recap", [{
+        label: "Exécution",
+        inserted: 0,
+        skipped: 0,
+        errors: [{ type: "Fatal", code: "exception", message: msg }],
+      }]);
+      throw err;
+    }
   },
 });
 

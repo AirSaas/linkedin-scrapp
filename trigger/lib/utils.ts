@@ -105,3 +105,83 @@ export function filterProfileViews(views: ProfileView[]): ProfileView[] {
     return true;
   });
 }
+
+// ============================================
+// ERROR REPORTING TO SLACK #script-logs
+// ============================================
+
+export interface TaskError {
+  type: string;
+  code: string | number;
+  message: string;
+  profile?: string;
+}
+
+export interface TaskResultGroup {
+  label: string;
+  inserted: number;
+  skipped: number;
+  errors: TaskError[];
+}
+
+/**
+ * Send a standardized error recap to the script_logs Slack webhook.
+ * Only sends if there are errors. Silent no-op if no errors or webhook not configured.
+ */
+export async function sendErrorToScriptLogs(
+  taskName: string,
+  groups: TaskResultGroup[]
+): Promise<void> {
+  const totalErrors = groups.reduce((sum, g) => sum + g.errors.length, 0);
+  if (totalErrors === 0) return;
+
+  const webhookUrl = process.env.script_logs ?? "";
+  if (!webhookUrl) {
+    console.warn("script_logs env var not set, skipping error alert");
+    return;
+  }
+
+  const now = new Date();
+  const dateStr = now.toISOString().substring(0, 10);
+  const timeStr = now.toISOString().substring(11, 16);
+
+  let message = `[${taskName}] ⚠️ Erreurs — ${dateStr} ${timeStr}\n`;
+
+  // Results section
+  message += `\n📊 Résultats\n`;
+  for (const group of groups) {
+    message += `• ${group.label}: ${group.inserted} insérés | ${group.skipped} ignorés\n`;
+  }
+
+  // Errors section — group by type (code) within each group
+  message += `\n❌ Erreurs (${totalErrors})\n`;
+  for (const group of groups) {
+    if (group.errors.length === 0) continue;
+
+    const grouped: Record<string, number> = {};
+    for (const err of group.errors) {
+      const key = `${err.type} (${err.code})`;
+      grouped[key] = (grouped[key] ?? 0) + 1;
+    }
+
+    const parts = Object.entries(grouped)
+      .map(([errType, count]) => `${count}x ${errType}`)
+      .join(", ");
+    message += `• ${group.label}: ${parts}\n`;
+  }
+
+  message += `\nTotal: ${totalErrors} erreurs`;
+
+  try {
+    await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: message }),
+    });
+  } catch (err) {
+    console.error(
+      "Failed to send error alert to script_logs:",
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+}

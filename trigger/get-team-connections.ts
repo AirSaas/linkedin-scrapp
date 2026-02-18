@@ -1,7 +1,7 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { supabase } from "./lib/supabase.js";
 import { unipile } from "./lib/unipile.js";
-import { sleep } from "./lib/utils.js";
+import { sleep, sendErrorToScriptLogs, type TaskResultGroup } from "./lib/utils.js";
 
 // ============================================
 // CONFIGURATION
@@ -98,6 +98,17 @@ export const getTeamConnectionsTask = schedules.task({
     }
 
     await sendSlackErrorReport(resultsByMember);
+
+    // Send error recap to #script-logs
+    const scriptLogGroups: TaskResultGroup[] = Object.entries(resultsByMember).map(
+      ([ownerUrl, stats]) => ({
+        label: ownerUrl.split("/in/")[1] ?? ownerUrl,
+        inserted: stats.inserted,
+        skipped: stats.duplicates,
+        errors: stats.errors,
+      })
+    );
+    await sendErrorToScriptLogs("Team Connections", scriptLogGroups);
 
     const summary = {
       success: totalInserted >= 0,
