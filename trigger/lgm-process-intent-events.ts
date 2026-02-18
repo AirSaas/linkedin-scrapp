@@ -970,7 +970,7 @@ async function sendGroupedSlackMessage(
   teamMembers: TeamMember[],
   errorCount: number
 ): Promise<{ success: boolean }> {
-  const webhookUrl = process.env.webhook_intent_events ?? "";
+  const webhookUrl = process.env.webhook_intent_events_lgm_activity ?? "";
 
   const eventsToSend = processedEvents.filter((e) => e.shouldSendSlack);
 
@@ -980,7 +980,7 @@ async function sendGroupedSlackMessage(
   }
 
   if (!webhookUrl) {
-    logger.warn("webhook_intent_events not set, skipping");
+    logger.warn("webhook_intent_events_lgm_activity not set, skipping");
     return { success: true };
   }
 
