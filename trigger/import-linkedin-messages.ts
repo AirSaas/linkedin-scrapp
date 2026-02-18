@@ -1,7 +1,7 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { getSupabase } from "./lib/supabase.js";
 import { unipile } from "./lib/unipile.js";
-import { sleep } from "./lib/utils.js";
+import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
 
 // ============================================
 // CONFIGURATION
@@ -87,7 +87,7 @@ export const importLinkedinMessagesTask = schedules.task({
     let newMessages = 0;
     let hubspotSent = 0;
     let zapierSent = 0;
-    let errors = 0;
+    const errorDetails: TaskError[] = [];
 
     // 3. Process each account
     for (const account of accounts) {
@@ -205,7 +205,7 @@ export const importLinkedinMessagesTask = schedules.task({
                   } catch (err) {
                     const m = err instanceof Error ? err.message : String(err);
                     logger.error(`HubSpot error for ${messageId}: ${m}`);
-                    errors++;
+                    errorDetails.push({ type: "HubSpot Sync", code: "exception", message: m, profile: messageId });
                   }
 
                   try {
@@ -214,7 +214,7 @@ export const importLinkedinMessagesTask = schedules.task({
                   } catch (err) {
                     const m = err instanceof Error ? err.message : String(err);
                     logger.error(`Zapier error for ${messageId}: ${m}`);
-                    errors++;
+                    errorDetails.push({ type: "Zapier Webhook", code: "exception", message: m, profile: messageId });
                   }
                 }
 
@@ -222,7 +222,7 @@ export const importLinkedinMessagesTask = schedules.task({
               } catch (err) {
                 const m = err instanceof Error ? err.message : String(err);
                 logger.error(`Error processing message: ${m}`);
-                errors++;
+                errorDetails.push({ type: "Message Processing", code: "exception", message: m });
               }
             }
 
@@ -230,7 +230,7 @@ export const importLinkedinMessagesTask = schedules.task({
           } catch (err) {
             const m = err instanceof Error ? err.message : String(err);
             logger.error(`Error processing chat ${chat.provider_id}: ${m}`);
-            errors++;
+            errorDetails.push({ type: "Chat Processing", code: "exception", message: m, profile: chat.provider_id });
           }
         }
 
@@ -238,9 +238,17 @@ export const importLinkedinMessagesTask = schedules.task({
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
         logger.error(`Error processing account ${account.linkedin_urn}: ${m}`);
-        errors++;
+        errorDetails.push({ type: "Account Processing", code: "exception", message: m, profile: account.linkedin_urn });
       }
     }
+
+    // Send error recap to #script-logs
+    await sendErrorToScriptLogs("Import LinkedIn Messages", [{
+      label: "Messages",
+      inserted: newMessages,
+      skipped: totalMessages - newMessages,
+      errors: errorDetails,
+    }]);
 
     const summary = {
       success: true,
@@ -251,7 +259,7 @@ export const importLinkedinMessagesTask = schedules.task({
       newMessages,
       hubspotSent,
       zapierSent,
-      errors,
+      errors: errorDetails.length,
     };
 
     logger.info("=== SUMMARY ===", summary);

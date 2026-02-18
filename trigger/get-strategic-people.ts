@@ -1,7 +1,7 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { supabase } from "./lib/supabase.js";
 import { unipile } from "./lib/unipile.js";
-import { sleep } from "./lib/utils.js";
+import { sleep, sendErrorToScriptLogs, type TaskResultGroup } from "./lib/utils.js";
 
 // ============================================
 // CONFIGURATION
@@ -128,6 +128,17 @@ export const getStrategicPeopleTask = schedules.task({
     }
 
     await sendSlackErrorReport(resultsBySearch);
+
+    // Send error recap to #script-logs
+    const scriptLogGroups: TaskResultGroup[] = Object.entries(resultsBySearch).map(
+      ([key, stats]) => ({
+        label: SAVED_SEARCHES.find((s) => s.key === key)?.name ?? key,
+        inserted: stats.inserted,
+        skipped: stats.skipped,
+        errors: stats.errors,
+      })
+    );
+    await sendErrorToScriptLogs("Strategic People SalesNav", scriptLogGroups);
 
     const summary = {
       success: totalInserted >= 0,

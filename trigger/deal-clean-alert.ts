@@ -1,5 +1,6 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { getSupabase } from "./lib/supabase.js";
+import { sendErrorToScriptLogs } from "./lib/utils.js";
 
 // ============================================
 // CONFIGURATION
@@ -77,6 +78,7 @@ export const dealCleanAlertTask = schedules.task({
   maxDuration: 120,
   run: async () => {
     logger.info("=== START deal-clean-alert ===");
+    try {
 
     // 1. Fetch deals
     const allDeals = await fetchDeals();
@@ -125,6 +127,18 @@ export const dealCleanAlertTask = schedules.task({
 
     logger.info("=== SUMMARY ===", summary);
     return summary;
+
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`Fatal error: ${msg}`);
+      await sendErrorToScriptLogs("Deal Clean Alert", [{
+        label: "Exécution",
+        inserted: 0,
+        skipped: 0,
+        errors: [{ type: "Fatal", code: "exception", message: msg }],
+      }]);
+      throw err;
+    }
   },
 });
 
