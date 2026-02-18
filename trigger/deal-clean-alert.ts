@@ -4,8 +4,6 @@ import { getSupabase } from "./lib/supabase.js";
 // ============================================
 // CONFIGURATION
 // ============================================
-const SLACK_WEBHOOK_DEAL_CLEAN_ALERT =
-  "https://hooks.zapier.com/hooks/catch/8419032/uw8ipql/";
 const HUBSPOT_PORTAL_ID = "7979190";
 
 // Pipelines
@@ -347,8 +345,14 @@ function buildSlackMessage(
 // SLACK WEBHOOK
 // ============================================
 async function sendToSlack(message: string): Promise<void> {
+  const webhookUrl = process.env.webhook_team_sales;
+  if (!webhookUrl) {
+    logger.error("webhook_team_sales not configured");
+    return;
+  }
+
   try {
-    const res = await fetch(SLACK_WEBHOOK_DEAL_CLEAN_ALERT, {
+    const res = await fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: message }),

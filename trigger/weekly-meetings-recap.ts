@@ -730,9 +730,9 @@ function buildStaticRecap(weekData: WeekData): string {
 // STEP 10 — SLACK WEBHOOK
 // ============================================
 async function sendSlackMessage(text: string): Promise<void> {
-  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+  const webhookUrl = process.env.webhook_sql_activity;
   if (!webhookUrl) {
-    logger.error("SLACK_WEBHOOK_URL not configured");
+    logger.error("webhook_sql_activity not configured");
     return;
   }
 

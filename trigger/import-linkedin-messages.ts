@@ -617,9 +617,9 @@ async function sendToZapier(
   messageRecord: Record<string, unknown>,
   participants: GhostGeniusParticipant[]
 ): Promise<void> {
-  const webhookUrl = process.env.ZAPIER_WEBHOOK_URL;
+  const webhookUrl = process.env.webhook_linkedin_message;
   if (!webhookUrl) {
-    logger.warn("ZAPIER_WEBHOOK_URL not configured, skipping");
+    logger.warn("webhook_linkedin_message not configured, skipping");
     return;
   }
 
