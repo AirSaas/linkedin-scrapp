@@ -258,8 +258,7 @@ async function getWorkspaceTeamMembers(): Promise<TeamMember[]> {
 async function getYesterdayIntentEvents(): Promise<IntentEvent[]> {
   const now = new Date();
   const yesterday = new Date(now);
-  // TEMP: backfill 10 days (revert to -1 after manual run)
-  yesterday.setDate(yesterday.getDate() - 10);
+  yesterday.setDate(yesterday.getDate() - 1);
   const yesterdayStr = yesterday.toISOString().split("T")[0];
   const todayStr = now.toISOString().split("T")[0];
 
@@ -284,8 +283,7 @@ async function getYesterdayIntentEvents(): Promise<IntentEvent[]> {
 async function getYesterdayConcurrentContacts(): Promise<ConcurrentContact[]> {
   const now = new Date();
   const yesterday = new Date(now);
-  // TEMP: backfill 10 days (revert to -1 after manual run)
-  yesterday.setDate(yesterday.getDate() - 10);
+  yesterday.setDate(yesterday.getDate() - 1);
   const yesterdayStr = yesterday.toISOString().split("T")[0];
   const todayStr = now.toISOString().split("T")[0];
 
