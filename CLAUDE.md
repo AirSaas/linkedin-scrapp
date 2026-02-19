@@ -30,6 +30,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/weekly-meetings-recap.ts` — weekly Monday recap of HubSpot meetings in SQL pipeline, enriched with AI (Anthropic Sonnet) and sent to Slack
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
+- `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
@@ -111,6 +112,16 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `hubspot_communication_id`: HubSpot communication ID (set after HubSpot sync for 1:1 threads)
 - `participant_owner_id`, `participants_numbers`, `main_participant_id`: denormalized from thread
 
+### `modjo_calls`
+- Modjo calls synced hourly (from `sync-modjo-calls`)
+- PK: `call_id` (Modjo call ID)
+- `hubspot_deal_id`, `hubspot_account_id`, `hubspot_contact_ids`: HubSpot associations
+- `participants`: JSON array `[{name, email, type, hubspot_id}]`
+- `ai_summary`: Modjo AI-generated summary
+- `transcript_clean`: formatted transcript with speaker names and timestamps
+- `topics`, `tags`: string arrays
+- `raw_data`: full Modjo API response
+
 ## External APIs (non-Unipile)
 
 - **LGM (LaGrowthMachine)**: `POST https://apiv2.lagrowthmachine.com/flow/leads?apikey=X` — send leads with audience name. Env var: `LGM_API_KEY`
@@ -121,6 +132,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - **Slack Webhook** (error log): `POST` to `script_logs` — script error alerts
 - **Zapier Webhook** (LinkedIn messages): `POST` to `webhook_linkedin_message` — LinkedIn message enrichment
 - **Zapier Webhook** (deal clean alert): `POST` to `webhook_team_sales` — deal cleaning alerts
+- **Modjo**: `POST https://api.modjo.ai/v1/calls/exports` — export calls with transcripts, speakers, HubSpot relations. Auth: `X-API-KEY` header. Env var: `MODJO_API_KEY`
 
 ## Unipile API
 
