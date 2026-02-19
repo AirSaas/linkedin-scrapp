@@ -241,6 +241,111 @@ export const lgmProcessIntentEventsTask = schedules.task({
 });
 
 // ============================================
+// BACKFILL TASK (10 DAYS)
+// ============================================
+export const lgmProcessIntentEvents10DaysTask = schedules.task({
+  id: "lgm-process-intent-events-10-days",
+  maxDuration: 600,
+  run: async () => {
+    logger.info("=== START lgm-process-intent-events-10-days (backfill) ===");
+
+    const lookbackDays = 10;
+
+    // 1. Get team members
+    const teamMembers = await getWorkspaceTeamMembers();
+    logger.info(`${teamMembers.length} team members found`);
+
+    // 2. Process Intent Events (10 days)
+    const intentResult = await processIntentEvents(teamMembers, lookbackDays);
+
+    // 3. Process Concurrent Contacts (10 days)
+    const concurrentResult = await processConcurrentContacts(teamMembers, lookbackDays);
+
+    // 4. Calculate total errors
+    const totalLgmFailed =
+      intentResult.lgmFailed + concurrentResult.lgmFailed;
+    const totalHubspotFailed =
+      intentResult.hubspotFailed +
+      concurrentResult.hubspotUpdateFailed +
+      concurrentResult.hubspotCreateFailed;
+    const totalErrorCount =
+      totalLgmFailed +
+      totalHubspotFailed +
+      intentResult.unmappedKeys.length;
+
+    // 5. Send grouped Slack message (main channel)
+    const slackResult = await sendGroupedSlackMessage(
+      intentResult.processedEvents,
+      teamMembers,
+      totalErrorCount
+    );
+
+    // 6. Send error alert (logerror channel) if needed
+    if (totalErrorCount > 0) {
+      const errorDetails: string[] = [];
+      if (intentResult.lgmFailed > 0)
+        errorDetails.push(
+          `Intent Events LGM: ${intentResult.lgmFailed} fails`
+        );
+      if (intentResult.hubspotFailed > 0)
+        errorDetails.push(
+          `Intent Events HubSpot: ${intentResult.hubspotFailed} fails`
+        );
+      if (concurrentResult.lgmFailed > 0)
+        errorDetails.push(
+          `Concurrent LGM: ${concurrentResult.lgmFailed} fails`
+        );
+      if (concurrentResult.hubspotUpdateFailed > 0)
+        errorDetails.push(
+          `Concurrent HubSpot Update: ${concurrentResult.hubspotUpdateFailed} fails`
+        );
+      if (concurrentResult.hubspotCreateFailed > 0)
+        errorDetails.push(
+          `Concurrent HubSpot Create: ${concurrentResult.hubspotCreateFailed} fails`
+        );
+      errorDetails.push(...concurrentResult.errors);
+
+      await sendSlackErrorAlert(
+        {
+          processed: intentResult.processed + concurrentResult.processed,
+          lgmFailed: totalLgmFailed,
+          hubspotFailed: totalHubspotFailed,
+          slackFailed: slackResult.success ? 0 : 1,
+          errors: errorDetails,
+        },
+        intentResult.unmappedKeys
+      );
+    }
+
+    const summary = {
+      success: true,
+      lookbackDays,
+      intentEvents: {
+        total: intentResult.total,
+        processed: intentResult.processed,
+        excluded: intentResult.excluded,
+        lgmSuccess: intentResult.lgmSuccess,
+        lgmFailed: intentResult.lgmFailed,
+        hubspotSuccess: intentResult.hubspotSuccess,
+        hubspotFailed: intentResult.hubspotFailed,
+      },
+      concurrentContacts: {
+        total: concurrentResult.total,
+        processed: concurrentResult.processed,
+        excluded: concurrentResult.excluded,
+        lgmSuccess: concurrentResult.lgmSuccess,
+        lgmFailed: concurrentResult.lgmFailed,
+        hubspotUpdateSuccess: concurrentResult.hubspotUpdateSuccess,
+        hubspotCreateSuccess: concurrentResult.hubspotCreateSuccess,
+      },
+    };
+
+    logger.info("=== SUMMARY (10-day backfill) ===", summary);
+    return summary;
+  },
+});
+
+// ============================================
 // SUPABASE HELPERS
 // ============================================
 async function getWorkspaceTeamMembers(): Promise<TeamMember[]> {
@@ -255,19 +360,19 @@ async function getWorkspaceTeamMembers(): Promise<TeamMember[]> {
   return (data ?? []) as TeamMember[];
 }
 
-async function getYesterdayIntentEvents(): Promise<IntentEvent[]> {
+async function getIntentEvents(lookbackDays = 1): Promise<IntentEvent[]> {
   const now = new Date();
-  const yesterday = new Date(now);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const yesterdayStr = yesterday.toISOString().split("T")[0];
+  const since = new Date(now);
+  since.setDate(since.getDate() - lookbackDays);
+  const sinceStr = since.toISOString().split("T")[0];
   const todayStr = now.toISOString().split("T")[0];
 
-  logger.info(`Fetching intent events from ${yesterdayStr}`);
+  logger.info(`Fetching intent events from ${sinceStr} (${lookbackDays} days)`);
 
   const { data, error } = await supabase
     .from("PRC_INTENT_EVENTS")
     .select("*")
-    .gte("EVENT_RECORDED_ON", yesterdayStr)
+    .gte("EVENT_RECORDED_ON", sinceStr)
     .lt("EVENT_RECORDED_ON", todayStr)
     .not("CONTACT_JOB_STRATEGIC_ROLE", "is", null)
     .neq("CONTACT_JOB_STRATEGIC_ROLE", "");
@@ -280,19 +385,19 @@ async function getYesterdayIntentEvents(): Promise<IntentEvent[]> {
   return (data ?? []) as IntentEvent[];
 }
 
-async function getYesterdayConcurrentContacts(): Promise<ConcurrentContact[]> {
+async function getConcurrentContacts(lookbackDays = 1): Promise<ConcurrentContact[]> {
   const now = new Date();
-  const yesterday = new Date(now);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const yesterdayStr = yesterday.toISOString().split("T")[0];
+  const since = new Date(now);
+  since.setDate(since.getDate() - lookbackDays);
+  const sinceStr = since.toISOString().split("T")[0];
   const todayStr = now.toISOString().split("T")[0];
 
-  logger.info(`Fetching concurrent contacts created on ${yesterdayStr}`);
+  logger.info(`Fetching concurrent contacts from ${sinceStr} (${lookbackDays} days)`);
 
   const { data, error } = await supabase
     .from("scrapped_strategic_connection_concurrent")
     .select("*")
-    .gte("created_at", yesterdayStr)
+    .gte("created_at", sinceStr)
     .lt("created_at", todayStr)
     .not("job_strategic_role", "is", null);
 
@@ -618,10 +723,10 @@ function isConnectedWithBertran(
 // ============================================
 // BUSINESS LOGIC - INTENT EVENTS
 // ============================================
-async function processIntentEvents(teamMembers: TeamMember[]) {
+async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) {
   logger.info("--- Processing Intent Events ---");
 
-  const events = await getYesterdayIntentEvents();
+  const events = await getIntentEvents(lookbackDays);
 
   let processed = 0;
   let excluded = 0;
@@ -755,7 +860,7 @@ async function processIntentEvents(teamMembers: TeamMember[]) {
 // ============================================
 // BUSINESS LOGIC - CONCURRENT CONTACTS
 // ============================================
-async function processConcurrentContacts(teamMembers: TeamMember[]) {
+async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays = 1) {
   logger.info("--- Processing Concurrent Contacts ---");
 
   const bertranInfo = getBertranFromTeam(teamMembers);
@@ -763,7 +868,7 @@ async function processConcurrentContacts(teamMembers: TeamMember[]) {
     `Bertran - HubSpot Owner ID: ${bertranInfo.hubspotOwnerId}`
   );
 
-  const contacts = await getYesterdayConcurrentContacts();
+  const contacts = await getConcurrentContacts(lookbackDays);
 
   let processed = 0;
   let excluded = 0;
