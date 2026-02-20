@@ -22,8 +22,9 @@ const EXCLUDED_LINKEDIN_PROFILES = [
   "https://www.linkedin.com/in/benitodiz/",
 ];
 
-// Mapping: owner|eventType|connected_status → action
+// Mapping: intent_owner|eventType|connected_status → action
 // "HUBSPOT" = update HubSpot, string = LGM audience, null = skip
+// Key uses INTENT_OWNER (who received the intent) + CONNECTED_WITH_INTENT_OWNER
 const AUDIENCE_MAPPING: Record<string, string | null> = {
   // THOMAS_POITAU
   "thomas_poitau|Reaction|connected_false":
@@ -34,12 +35,13 @@ const AUDIENCE_MAPPING: Record<string, string | null> = {
     "thomas_poitau_warm_leads_connected_false_q1_2025",
   "thomas_poitau|Follow Team Member|connected_false":
     "thomas_poitau_warm_leads_connected_false_q1_2025",
+  "thomas_poitau|Connect|connected_false":
+    "thomas_poitau_warm_leads_connected_false_q1_2025",
   "thomas_poitau|Reaction|connected_true": "HUBSPOT",
   "thomas_poitau|Comment|connected_true": "HUBSPOT",
   "thomas_poitau|Visit Profile|connected_true": "HUBSPOT",
   "thomas_poitau|Follow Team Member|connected_true": "HUBSPOT",
-  "thomas_poitau|Connect|connected_false": null,
-  "thomas_poitau|Connect|connected_true": null,
+  "thomas_poitau|Connect|connected_true": "HUBSPOT",
 
   // BERTRAN_RUIZ
   "bertran_ruiz|Reaction|connected_false":
@@ -50,12 +52,13 @@ const AUDIENCE_MAPPING: Record<string, string | null> = {
     "bertran_ruiz_warm_leads_connected_false_q1_2025",
   "bertran_ruiz|Follow Team Member|connected_false":
     "bertran_ruiz_warm_leads_connected_false_q1_2025",
+  "bertran_ruiz|Connect|connected_false":
+    "bertran_ruiz_warm_leads_connected_false_q1_2025",
   "bertran_ruiz|Reaction|connected_true": "HUBSPOT",
   "bertran_ruiz|Comment|connected_true": "HUBSPOT",
   "bertran_ruiz|Visit Profile|connected_true": "HUBSPOT",
   "bertran_ruiz|Follow Team Member|connected_true": "HUBSPOT",
-  "bertran_ruiz|Connect|connected_false": null,
-  "bertran_ruiz|Connect|connected_true": null,
+  "bertran_ruiz|Connect|connected_true": "HUBSPOT",
 
   // SIMON_VACHER
   "simon_vacher|Reaction|connected_false":
@@ -66,22 +69,19 @@ const AUDIENCE_MAPPING: Record<string, string | null> = {
     "simon_vacher_warm_leads_connected_false_q1_2025",
   "simon_vacher|Follow Team Member|connected_false":
     "simon_vacher_warm_leads_connected_false_q1_2025",
+  "simon_vacher|Connect|connected_false":
+    "simon_vacher_warm_leads_connected_false_q1_2025",
   "simon_vacher|Reaction|connected_true": "HUBSPOT",
   "simon_vacher|Comment|connected_true": "HUBSPOT",
   "simon_vacher|Visit Profile|connected_true": "HUBSPOT",
   "simon_vacher|Follow Team Member|connected_true": "HUBSPOT",
-  "simon_vacher|Connect|connected_false": null,
-  "simon_vacher|Connect|connected_true": null,
+  "simon_vacher|Connect|connected_true": "HUBSPOT",
+};
 
-  // AIRSAAS (page)
-  "airsaas|Follow Page|connected_false": "airsaas_follow_page_q1_2025",
-  "airsaas|Follow Page|connected_true": "airsaas_follow_page_q1_2025",
-
-  // PRODELATRANSFO (page)
-  "prodelatransfo|Follow Page|connected_false":
-    "prodelatransfo_follow_page_q1_2025",
-  "prodelatransfo|Follow Page|connected_true":
-    "prodelatransfo_follow_page_q1_2025",
+// Follow Page → always LGM to page audience (identified by EVENT_RECORD_ORIGIN)
+const PAGE_AUDIENCES: Record<string, string> = {
+  Airsaas: "airsaas_follow_page_q1_2025",
+  ProDeLaTransfo: "prodelatransfo_follow_page_q1_2025",
 };
 
 // Mapping sales_nav_source → LGM audience for concurrent contacts
@@ -102,8 +102,11 @@ interface IntentEvent {
   CONTACT_LOCATION?: string;
   CONTACT_HUBSPOT_ID?: string;
   BUSINESS_OWNER?: string;
+  INTENT_OWNER?: string;
   INTENT_EVENT_TYPE?: string;
   CONNECTED_WITH_BUSINESS_OWNER?: boolean | string;
+  CONNECTED_WITH_INTENT_OWNER?: boolean;
+  EVENT_RECORD_ORIGIN?: string;
   CONTACT_JOB_STRATEGIC_ROLE?: string;
 }
 
@@ -587,6 +590,45 @@ async function updateHubspotContactAgentActivated(
   }
 }
 
+async function assignHubspotOwnerAndActivate(
+  contactHubspotId: string,
+  ownerHubspotId: string
+): Promise<{ success: boolean }> {
+  const token = process.env.HUBSPOT_ACCESS_TOKEN ?? "";
+  const url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactHubspotId}`;
+
+  try {
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        properties: {
+          hubspot_owner_id: ownerHubspotId,
+          agent_ia_activated: "true",
+        },
+      }),
+    });
+
+    if (res.ok) {
+      logger.info(
+        `HubSpot ASSIGN+ACTIVATE OK - Contact: ${contactHubspotId}, owner: ${ownerHubspotId}`
+      );
+      return { success: true };
+    } else {
+      const text = await res.text();
+      logger.error(`HubSpot ASSIGN+ACTIVATE error ${res.status}: ${text}`);
+      return { success: false };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`HubSpot ASSIGN+ACTIVATE exception: ${msg}`);
+    return { success: false };
+  }
+}
+
 async function createHubspotContact(
   record: ConcurrentContact,
   ownerId: string
@@ -651,9 +693,9 @@ function isExcludedProfile(linkedinUrl: string | undefined | null): boolean {
   });
 }
 
-function normalizeBusinessOwner(businessOwner: string | undefined | null): string {
-  if (!businessOwner) return "unknown";
-  return businessOwner
+function normalizeOwner(owner: string | undefined | null): string {
+  if (!owner) return "unknown";
+  return owner
     .toLowerCase()
     .trim()
     .replace(/[\r\n\t]/g, "")
@@ -661,32 +703,42 @@ function normalizeBusinessOwner(businessOwner: string | undefined | null): strin
 }
 
 function buildMappingKey(
-  businessOwner: string | undefined,
+  intentOwner: string | undefined,
   eventType: string | undefined,
-  connectedWithBusinessOwner: boolean | string | undefined
+  connectedWithIntentOwner: boolean | undefined
 ): string {
-  const ownerLower = normalizeBusinessOwner(businessOwner);
+  const ownerLower = normalizeOwner(intentOwner);
   const connectedStatus =
-    connectedWithBusinessOwner === true ||
-    connectedWithBusinessOwner === "true"
+    connectedWithIntentOwner === true
       ? "connected_true"
       : "connected_false";
   return `${ownerLower}|${eventType}|${connectedStatus}`;
 }
 
 function getActionForRecord(
-  businessOwner: string | undefined,
+  intentOwner: string | undefined,
   eventType: string | undefined,
-  connectedWithBusinessOwner: boolean | string | undefined
+  connectedWithIntentOwner: boolean | undefined
 ): { action: string | null; keyExists: boolean; key: string } {
   const key = buildMappingKey(
-    businessOwner,
+    intentOwner,
     eventType,
-    connectedWithBusinessOwner
+    connectedWithIntentOwner
   );
   const keyExists = key in AUDIENCE_MAPPING;
   const action = keyExists ? AUDIENCE_MAPPING[key] : null;
   return { action, keyExists, key };
+}
+
+function getHubspotIdForIntentOwner(
+  intentOwner: string | undefined,
+  teamMembers: TeamMember[]
+): string | null {
+  if (!intentOwner) return null;
+  const member = teamMembers.find(
+    (m) => m.hubspot_connected_with_value === intentOwner
+  );
+  return member?.hubspot_id ?? null;
 }
 
 function parseConnectedWith(
@@ -749,15 +801,48 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
       continue;
     }
 
-    const { action, keyExists, key } = getActionForRecord(
-      record.BUSINESS_OWNER,
+    let shouldSendSlack = true;
+    let action: string | null = null;
+
+    // --- Follow Page: always LGM to page audience ---
+    if (record.INTENT_EVENT_TYPE === "Follow Page") {
+      const pageOrigin = record.EVENT_RECORD_ORIGIN ?? "";
+      const pageAudience = PAGE_AUDIENCES[pageOrigin];
+
+      if (pageAudience) {
+        action = pageAudience;
+        const lgmPayload = buildIntentEventLgmPayload(record, pageAudience);
+        const lgmResult = await sendToLgm(lgmPayload);
+        if (lgmResult.success) {
+          lgmSuccess++;
+        } else {
+          lgmFailed++;
+          shouldSendSlack = false;
+        }
+        await sleep(RATE_LIMIT.PAUSE_BETWEEN_API_CALLS);
+      } else {
+        logger.warn(`Unknown Follow Page origin: "${pageOrigin}" for ${fullName}`);
+        lgmSkipped++;
+        shouldSendSlack = false;
+      }
+
+      processedEvents.push({ record, action, shouldSendSlack });
+      processed++;
+      await sleep(RATE_LIMIT.PAUSE_BETWEEN_EVENTS);
+      continue;
+    }
+
+    // --- All other events: routing based on INTENT_OWNER + CONNECTED_WITH_INTENT_OWNER ---
+    const { action: mappedAction, keyExists, key } = getActionForRecord(
+      record.INTENT_OWNER,
       record.INTENT_EVENT_TYPE,
-      record.CONNECTED_WITH_BUSINESS_OWNER
+      record.CONNECTED_WITH_INTENT_OWNER
     );
+    action = mappedAction;
 
     // Track unmapped keys
     if (!keyExists) {
-      const rawOwner = record.BUSINESS_OWNER || "(empty)";
+      const rawOwner = record.INTENT_OWNER || "(empty)";
       const contactName = fullName || "(unknown)";
       const company = record.COMPANY_NAME || "(unknown company)";
 
@@ -773,10 +858,8 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
       }
     }
 
-    let shouldSendSlack = true;
-
     if (action === "HUBSPOT") {
-      // Connected → HubSpot update
+      // Connected with intent owner → HubSpot routing based on BUSINESS_OWNER
       const contactHubspotId = record.CONTACT_HUBSPOT_ID;
 
       if (!contactHubspotId) {
@@ -784,36 +867,69 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
         hubspotSkipped++;
         shouldSendSlack = false;
       } else {
-        const getResult =
-          await getHubspotContactCancelStatus(contactHubspotId);
+        const businessOwner = record.BUSINESS_OWNER;
+        const intentOwner = record.INTENT_OWNER;
 
-        if (!getResult.success) {
-          hubspotFailed++;
-          shouldSendSlack = false;
-        } else if (
-          getResult.cancelValue !== null &&
-          getResult.cancelValue !== "" &&
-          getResult.cancelValue !== undefined
-        ) {
+        if (!businessOwner) {
+          // Cas 1: BUSINESS_OWNER is null → assign intent owner as HubSpot owner + activate
+          const intentOwnerHubspotId = getHubspotIdForIntentOwner(intentOwner, teamMembers);
+          if (intentOwnerHubspotId) {
+            const assignResult = await assignHubspotOwnerAndActivate(
+              contactHubspotId,
+              intentOwnerHubspotId
+            );
+            if (assignResult.success) {
+              hubspotSuccess++;
+            } else {
+              hubspotFailed++;
+            }
+            shouldSendSlack = assignResult.success;
+          } else {
+            logger.warn(`No HubSpot ID found for intent owner: ${intentOwner}`);
+            hubspotFailed++;
+            shouldSendSlack = false;
+          }
+        } else if (businessOwner === intentOwner) {
+          // Cas 2: BUSINESS_OWNER = INTENT_OWNER → existing logic (check cancel, then activate)
+          const getResult =
+            await getHubspotContactCancelStatus(contactHubspotId);
+
+          if (!getResult.success) {
+            hubspotFailed++;
+            shouldSendSlack = false;
+          } else if (
+            getResult.cancelValue !== null &&
+            getResult.cancelValue !== "" &&
+            getResult.cancelValue !== undefined
+          ) {
+            logger.info(
+              `HubSpot skip - cancel_agent_ia_activated non-empty for ${fullName}`
+            );
+            hubspotSkipped++;
+            shouldSendSlack = false;
+          } else {
+            const updateResult =
+              await updateHubspotContactAgentActivated(contactHubspotId);
+            if (updateResult.success) {
+              hubspotSuccess++;
+            } else {
+              hubspotFailed++;
+            }
+            shouldSendSlack = updateResult.success;
+          }
+        } else {
+          // Cas 3: BUSINESS_OWNER ≠ INTENT_OWNER → skip for now
+          // TODO: decide how to handle cross-owner intent events
           logger.info(
-            `HubSpot skip - cancel_agent_ia_activated non-empty for ${fullName}`
+            `HubSpot skip - BO(${businessOwner}) ≠ IO(${intentOwner}) for ${fullName}`
           );
           hubspotSkipped++;
           shouldSendSlack = false;
-        } else {
-          const updateResult =
-            await updateHubspotContactAgentActivated(contactHubspotId);
-          if (updateResult.success) {
-            hubspotSuccess++;
-          } else {
-            hubspotFailed++;
-          }
-          shouldSendSlack = updateResult.success;
         }
         await sleep(RATE_LIMIT.PAUSE_BETWEEN_API_CALLS);
       }
     } else if (action !== null) {
-      // Not connected → LGM
+      // Not connected with intent owner → LGM
       const lgmPayload = buildIntentEventLgmPayload(record, action);
       const lgmResult = await sendToLgm(lgmPayload);
 
@@ -825,7 +941,7 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
       }
       await sleep(RATE_LIMIT.PAUSE_BETWEEN_API_CALLS);
     } else {
-      // action === null → skip
+      // action === null → skip (unmapped key)
       lgmSkipped++;
       shouldSendSlack = false;
     }
@@ -1007,16 +1123,16 @@ function getBertranFromTeam(teamMembers: TeamMember[]): {
 // SLACK - GROUPED MESSAGE (MAIN CHANNEL)
 // ============================================
 function getSlackIdForOwner(
-  businessOwner: string | undefined,
+  owner: string | undefined,
   teamMembers: TeamMember[]
 ): string | null {
-  if (!businessOwner) return null;
-  const normalizedOwner = normalizeBusinessOwner(businessOwner);
+  if (!owner) return null;
+  const normalizedOwner = normalizeOwner(owner);
 
   const member = teamMembers.find(
     (m) =>
       m.hubspot_connected_with_value &&
-      normalizeBusinessOwner(m.hubspot_connected_with_value) ===
+      normalizeOwner(m.hubspot_connected_with_value) ===
         normalizedOwner
   );
 
@@ -1042,9 +1158,7 @@ function formatIntentEventLine(record: IntentEvent): string {
   }
 
   const eventType = record.INTENT_EVENT_TYPE ?? "";
-  const connected =
-    record.CONNECTED_WITH_BUSINESS_OWNER === true ||
-    record.CONNECTED_WITH_BUSINESS_OWNER === "true";
+  const connected = record.CONNECTED_WITH_INTENT_OWNER === true;
   const connectionStatus = connected
     ? "connected"
     : "not connected";
@@ -1100,17 +1214,17 @@ async function sendGroupedSlackMessage(
   }[] = [];
 
   for (const event of eventsToSend) {
-    const normalizedOwner = normalizeBusinessOwner(
-      event.record.BUSINESS_OWNER
-    );
-    const isPage = ["airsaas", "prodelatransfo"].includes(normalizedOwner);
+    const isFollowPage = event.record.INTENT_EVENT_TYPE === "Follow Page";
 
-    if (isPage) {
+    if (isFollowPage) {
+      const pageOrigin = event.record.EVENT_RECORD_ORIGIN ?? "unknown";
       pagesEvents.push({
         record: event.record,
-        pageName: normalizedOwner,
+        pageName: pageOrigin,
       });
     } else {
+      const normalizedOwner = normalizeOwner(event.record.INTENT_OWNER);
+
       if (!groupedByOwner[normalizedOwner]) {
         groupedByOwner[normalizedOwner] = { hubspot: [], lgm: [] };
       }
@@ -1163,8 +1277,7 @@ async function sendGroupedSlackMessage(
     message += `\n📄 *Pages* → LGM\n`;
     for (const event of pagesEvents) {
       const record = event.record;
-      const pageName =
-        event.pageName === "airsaas" ? "Airsaas" : "ProDeLaTransfo";
+      const pageName = event.pageName;
 
       const firstName = record.CONTACT_FIRST_NAME ?? "";
       const lastName = record.CONTACT_LAST_NAME ?? "";
@@ -1261,7 +1374,7 @@ async function sendSlackErrorAlert(
     for (const k of unmappedKeys) {
       message += `\n• \`${k.key}\``;
       message += `\n  → Contact: ${k.example}`;
-      message += `\n  → BUSINESS_OWNER brut: \`${k.rawOwner}\``;
+      message += `\n  → INTENT_OWNER brut: \`${k.rawOwner}\``;
     }
   }
 
