@@ -158,16 +158,23 @@ export async function sendErrorToScriptLogs(
   for (const group of groups) {
     if (group.errors.length === 0) continue;
 
-    const grouped: Record<string, number> = {};
+    const grouped: Record<string, { count: number; sample: string }> = {};
     for (const err of group.errors) {
       const key = `${err.type} (${err.code})`;
-      grouped[key] = (grouped[key] ?? 0) + 1;
+      if (!grouped[key]) {
+        grouped[key] = { count: 1, sample: err.message.substring(0, 120) };
+      } else {
+        grouped[key].count++;
+      }
     }
 
     const parts = Object.entries(grouped)
-      .map(([errType, count]) => `${count}x ${errType}`)
+      .map(([errType, { count }]) => `${count}x ${errType}`)
       .join(", ");
     message += `• ${group.label}: ${parts}\n`;
+    for (const [, { sample }] of Object.entries(grouped)) {
+      message += `  → "${sample}"\n`;
+    }
   }
 
   message += `\nTotal: ${totalErrors} erreurs`;
