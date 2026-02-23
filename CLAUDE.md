@@ -338,6 +338,52 @@ flowchart TD
   ```
   Les webhooks d'activité existants (recap succès, notifications métier) sont séparés et ne remplacent pas cette alerte erreur.
 
+## Agent Workflow Rules
+
+### Plan Mode
+- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- If something goes sideways, STOP and re-plan immediately
+- Use plan mode for verification steps, not just building
+- Write detailed specs upfront to reduce ambiguity
+
+### Subagents
+- Use subagents liberally to keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, throw more compute at it via subagents
+- One task per subagent for focused execution
+
+### Self-Improvement
+- After ANY correction from the user: update memory with the pattern
+- Write rules that prevent the same mistake recurring
+- Review lessons at session start for relevant project context
+
+### Verification
+- Never mark a task complete without proving it works
+- Diff behavior between main and your changes when relevant
+- Ask yourself: "Would a staff engineer approve this?"
+- Run TypeScript compilation, check logs, demonstrate correctness
+
+### Elegance (Balanced)
+- For non-trivial changes: pause and ask "is there a more elegant way?"
+- If a fix feels hacky, step back and implement the clean solution
+- Skip this for simple, obvious fixes — don't over-engineer
+
+### Autonomous Bug Fixing
+- When given a bug report: investigate and fix it autonomously
+- Point at logs, errors, failing tests — then resolve them
+- Zero context switching required from the user
+
+### Task Management
+- Plan first: write plan with checkable items
+- Track progress: mark items complete as you go
+- Explain changes: high-level summary at each step
+- Capture lessons: update memory after corrections
+
+### Core Principles
+- **Simplicity first**: make every change as simple as possible, minimal code impact
+- **No laziness**: find root causes, no temporary fixes, senior developer standards
+- **Minimal impact**: changes should only touch what's necessary
+
 ## Supabase Tables
 
 ### `scrapped_visit`
