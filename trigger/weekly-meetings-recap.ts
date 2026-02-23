@@ -49,6 +49,11 @@ const DEALSTAGE_MAP: Record<string, string> = {
 
 const DAY_LABELS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 
+const WEEKDAY_MAP: Record<string, number> = {
+  "lundi": 1, "mardi": 2, "mercredi": 3,
+  "jeudi": 4, "vendredi": 5, "samedi": 6, "dimanche": 0,
+};
+
 // ============================================
 // TYPES
 // ============================================
@@ -205,38 +210,41 @@ function getWeekBounds() {
     10
   );
 
-  // Create a date object for today in Paris
-  const todayParis = new Date(
-    `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00+01:00`
-  );
-  const dayOfWeek = todayParis.getDay(); // 0=Sun, 1=Mon, ...
+  // Get day of week from Paris timezone parts (avoids .getDay() which uses server TZ)
+  const weekdayName = parisParts.find((p) => p.type === "weekday")!.value.toLowerCase();
+  const dayOfWeek = WEEKDAY_MAP[weekdayName] ?? 0; // 0=Sun, 1=Mon, ...
   const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
 
-  const monday = new Date(todayParis);
-  monday.setDate(monday.getDate() + diffToMonday);
+  // Use Date.UTC to avoid server timezone issues with .getDate()/.setDate()
+  const todayUTC = new Date(Date.UTC(year, month - 1, day));
+  const mondayUTC = new Date(todayUTC);
+  mondayUTC.setUTCDate(mondayUTC.getUTCDate() + diffToMonday);
 
   // Build day dates for Mon-Fri
   const dayDates: Date[] = [];
   for (let i = 0; i < 5; i++) {
-    const d = new Date(monday);
-    d.setDate(d.getDate() + i);
+    const d = new Date(mondayUTC);
+    d.setUTCDate(d.getUTCDate() + i);
     dayDates.push(d);
   }
 
   // Monday 00:00:00 Paris → epoch ms
-  const mondayStr = `${monday.getFullYear()}-${String(monday.getMonth() + 1).padStart(2, "0")}-${String(monday.getDate()).padStart(2, "0")}T00:00:00`;
+  const mondayStr = `${mondayUTC.getUTCFullYear()}-${String(mondayUTC.getUTCMonth() + 1).padStart(2, "0")}-${String(mondayUTC.getUTCDate()).padStart(2, "0")}T00:00:00`;
   const mondayMs = dateInParis(mondayStr).getTime();
 
   // Friday 23:59:59 Paris → epoch ms
   const friday = dayDates[4];
-  const fridayStr = `${friday.getFullYear()}-${String(friday.getMonth() + 1).padStart(2, "0")}-${String(friday.getDate()).padStart(2, "0")}T23:59:59`;
+  const fridayStr = `${friday.getUTCFullYear()}-${String(friday.getUTCMonth() + 1).padStart(2, "0")}-${String(friday.getUTCDate()).padStart(2, "0")}T23:59:59`;
   const fridayMs = dateInParis(fridayStr).getTime();
 
+  const mondayDay = mondayUTC.getUTCDate();
+  const mondayMonth = mondayUTC.getUTCMonth();
+  const mondayYear = mondayUTC.getUTCFullYear();
   const monthNames = [
     "janvier", "février", "mars", "avril", "mai", "juin",
     "juillet", "août", "septembre", "octobre", "novembre", "décembre",
   ];
-  const weekLabel = `Semaine du ${monday.getDate()} ${monthNames[monday.getMonth()]} ${monday.getFullYear()}`;
+  const weekLabel = `Semaine du ${mondayDay} ${monthNames[mondayMonth]} ${mondayYear}`;
 
   return { mondayMs, fridayMs, weekLabel, dayDates };
 }
@@ -558,7 +566,7 @@ function buildWeekData(
   dayDates: Date[]
 ): WeekData {
   const days: DayData[] = dayDates.map((date, i) => ({
-    dayLabel: `${DAY_LABELS[i]} ${String(date.getDate()).padStart(2, "0")}/${String(date.getMonth() + 1).padStart(2, "0")}`,
+    dayLabel: `${DAY_LABELS[i]} ${String(date.getUTCDate()).padStart(2, "0")}/${String(date.getUTCMonth() + 1).padStart(2, "0")}`,
     meetings: [],
     totalAmount: 0,
   }));
