@@ -205,7 +205,10 @@ export const importLinkedinMessagesTask = schedules.task({
                   } catch (err) {
                     const m = err instanceof Error ? err.message : String(err);
                     logger.error(`HubSpot error for ${messageId}: ${m}`);
-                    errorDetails.push({ type: "HubSpot Sync", code: "exception", message: m, profile: messageId });
+                    let code = "exception";
+                    if (m.includes("Contact search failed")) code = "contact_search";
+                    else if (m.includes("Communication POST failed")) code = "communication_post";
+                    errorDetails.push({ type: "HubSpot Sync", code, message: m, profile: messageId });
                   }
 
                   try {
@@ -560,7 +563,14 @@ async function sendToHubSpot(
   }
 
   const mainParticipantId = messageRecord.main_participant_id as string;
-  const contact = await findHubSpotContact(mainParticipantId);
+
+  let contact;
+  try {
+    contact = await findHubSpotContact(mainParticipantId);
+  } catch (err) {
+    const em = err instanceof Error ? err.message : String(err);
+    throw new Error(`Contact search failed: ${em}`);
+  }
   await sleep(RATE_LIMIT.BETWEEN_HUBSPOT_CALLS);
 
   if (!contact) {
@@ -593,20 +603,26 @@ async function sendToHubSpot(
     });
   }
 
-  const response = await callHubSpot(
-    `${HUBSPOT_API_BASE}/crm/v3/objects/communications`,
-    "POST",
-    {
-      properties: {
-        hs_communication_channel_type: "LINKEDIN_MESSAGE",
-        hs_communication_logged_from: "CRM",
-        hs_communication_body: communicationBody,
-        hs_timestamp: messageRecord.message_date,
-        hubspot_owner_id: hubspotOwnerId,
-      },
-      associations,
-    }
-  );
+  let response;
+  try {
+    response = await callHubSpot(
+      `${HUBSPOT_API_BASE}/crm/v3/objects/communications`,
+      "POST",
+      {
+        properties: {
+          hs_communication_channel_type: "LINKEDIN_MESSAGE",
+          hs_communication_logged_from: "CRM",
+          hs_communication_body: communicationBody,
+          hs_timestamp: messageRecord.message_date,
+          hubspot_owner_id: hubspotOwnerId,
+        },
+        associations,
+      }
+    );
+  } catch (err) {
+    const em = err instanceof Error ? err.message : String(err);
+    throw new Error(`Communication POST failed: ${em}`);
+  }
 
   const hsId = response.id as string | undefined;
   if (hsId) {

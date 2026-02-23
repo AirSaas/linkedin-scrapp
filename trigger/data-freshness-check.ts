@@ -263,19 +263,24 @@ async function evaluateWithAI(
     apiKey: process.env.ANTHROPIC_API_KEY,
   });
 
+  const dayNames = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];
+  const now = new Date();
+  const checkedDay = dayNames[now.getUTCDay()];
+
   const tableData = tables.map((t) => ({
     table: t.table,
     current_count: t.count,
     period: periodLabel,
     is_monday_7day_check: isMonday,
+    checked_day: checkedDay,
     daily_counts_last_30_days: t.history,
   }));
 
   const prompt = `Voici les counts quotidiens des 30 derniers jours pour des tables Supabase, ainsi que le count sur la période vérifiée aujourd'hui.
 
 Évalue si le count actuel est normal pour chaque table.
-Tiens compte des patterns jour de la semaine / weekend (certaines tables ont moins de données le weekend, c'est normal).
-${isMonday ? "Aujourd'hui c'est lundi, on vérifie les 7 derniers jours (le total doit correspondre à environ une semaine complète)." : "On vérifie J-1 uniquement."}
+Aujourd'hui c'est ${checkedDay}. ${isMonday ? "On vérifie les 7 derniers jours (le total doit correspondre à environ une semaine complète)." : "On vérifie J-1 uniquement."}
+IMPORTANT sur le weekend : si la période vérifiée tombe un samedi ou dimanche, les counts peuvent être très réduits (jusqu'à 90% de baisse par rapport aux jours ouvrés). C'est NORMAL — ne signale PAS d'anomalie ni de warning le weekend sauf si le count est exactement 0.
 
 Données :
 ${JSON.stringify(tableData, null, 2)}

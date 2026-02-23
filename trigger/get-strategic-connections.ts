@@ -267,9 +267,13 @@ async function processConfig(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.warn(`Error processing ${identifier}: ${msg}`);
+      let code = "exception";
+      if (msg.includes("404")) code = "not_found";
+      else if (msg.includes("429")) code = "rate_limit";
+      else if (/5\d\d/.test(msg)) code = "server_error";
       stats.errors.push({
         type: "Enrichissement",
-        code: "exception",
+        code,
         message: msg,
         profile: identifier,
       });
