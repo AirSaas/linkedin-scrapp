@@ -30,6 +30,7 @@ interface PrcActivity {
   ACTIVITY_DIRECTION?: string;
   ACTIVITY_METADATA?: string | Record<string, unknown>;
   IS_CONTACT_IA_AGENT_ACTIVATED?: boolean;
+  IS_CANCEL_AGENT_IA_ACTIVATED?: boolean;
   _airbyte_generation_id?: number;
 }
 
@@ -104,7 +105,9 @@ export const sendContactsToLanggraphTask = schedules.task({
 
     // 2. Filter: IS_CONTACT_IA_AGENT_ACTIVATED === true
     const filtered = allActivities.filter(
-      (a) => a.IS_CONTACT_IA_AGENT_ACTIVATED === true
+      (a) =>
+        a.IS_CONTACT_IA_AGENT_ACTIVATED === true &&
+        a.IS_CANCEL_AGENT_IA_ACTIVATED !== true
     );
     logger.info(
       `${filtered.length} activities with IA agent activated (${
