@@ -31,9 +31,9 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
-- `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (airsaas Supabase), builds structured JSON per contact, stores in `agent_ia_contact_payload` (dest Supabase), sends to LangGraph async /runs endpoint
+- `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (airsaas Supabase), builds structured JSON per contact, sends to LangGraph async /runs endpoint
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees)
-- `trigger/lib/supabase.ts` — Supabase clients: `getSupabase()` for source (airsaas `ybgckyywiobxfsyvddtx`), `getSupabaseIaSales()` for destination (`rcpcdpxqjxeikbssprdz`). Both lazy-init.
+- `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
 
 ## Task Flow Diagrams
@@ -76,7 +76,7 @@ flowchart LR
     DCA --> ZP
     DFC --> SL
     SMC --> SB_O & SL
-    SCL --> SB_O & LG & SL
+    SCL --> LG & SL
 ```
 
 ### `get-profil-views` (daily)
@@ -327,16 +327,14 @@ flowchart TD
     A([Cron]) --> B[Fetch PRC_CONTACT_ACTIVITIES<br/>from airsaas Supabase — paginé par 1000]
     B --> C[Filtrer IS_CONTACT_IA_AGENT_ACTIVATED = true]
     C --> D[Grouper par CONTACT_HUBSPOT_ID]
-    D --> E[Clear agent_ia_contact_payload<br/>on dest Supabase]
-    E --> F{Pour chaque contact}
-    F --> G[Dédupliquer activités<br/>par ACTIVITY_ID]
-    G --> H[Construire JSON payload<br/>contact_info + activities + stats]
-    H --> I[INSERT dans<br/>agent_ia_contact_payload]
-    I --> J[POST LangGraph /runs<br/>assistant_id: full_pipeline]
-    J -->|Success| K[Update status: sent<br/>+ store run_id]
-    J -->|Error| L[Update status: error<br/>+ store error_message]
-    F -->|All done| M{{Slack: script_logs}}
-    F -->|Errors| N{{sendErrorToScriptLogs}}
+    D --> E{Pour chaque contact}
+    E --> F[Dédupliquer activités<br/>par ACTIVITY_ID]
+    F --> G[Construire JSON payload<br/>contact_info + activities + stats]
+    G --> H[POST LangGraph /runs<br/>assistant_id: full_pipeline]
+    H -->|Success| I[Log sent]
+    H -->|Error| J[Log error]
+    E -->|All done| K{{Slack: script_logs}}
+    E -->|Errors| L{{sendErrorToScriptLogs}}
 ```
 
 ## Important Rules
@@ -477,13 +475,6 @@ flowchart TD
 - Contact activities synced via Airbyte, read-only
 - Fields: `CONTACT_HUBSPOT_ID`, `CONTACT_FULL_NAME`, `CONTACT` (JSON), `DEALS` (JSON), `OWNER_INTENT_HUBSPOT` (JSON), `OWNER_CONTACT_INTENT_HUBSPOT` (JSON), `SENDER` (JSON), `ACTIVITY_ID`, `ACTIVITY_TYPE`, `ACTIVITY_RECORDED_ON`, `ACTIVITY_DIRECTION`, `ACTIVITY_METADATA` (JSON), `IS_CONTACT_IA_AGENT_ACTIVATED`, `_airbyte_generation_id`
 - Used by `send-contacts-to-langgraph`
-
-### `agent_ia_contact_payload`
-- **Supabase project**: `rcpcdpxqjxeikbssprdz` — read/write via `SUPABASE_IA_SALES_URL`/`SUPABASE_IA_SALES_KEY`
-- Stores built JSON payloads per contact before/after LangGraph send
-- PK: `id` (bigserial)
-- `contact_hubspot_id`, `full_name`, `payload` (JSONB), `langgraph_status` (pending/sent/error), `langgraph_run_id`, `error_message`, `batch_id`, `created_at`
-- Cleared and rewritten at each run
 
 ## External APIs (non-Unipile)
 

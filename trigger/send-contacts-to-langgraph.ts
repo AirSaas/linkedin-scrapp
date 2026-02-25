@@ -1,6 +1,5 @@
-import { logger, metadata, schedules } from "@trigger.dev/sdk/v3";
+import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { supabase } from "./lib/supabase.js";
-import { getSupabaseIaSales } from "./lib/supabase.js";
 import {
   sleep,
   sendErrorToScriptLogs,
@@ -98,7 +97,7 @@ export const sendContactsToLanggraphTask = schedules.task({
     const batchId = new Date().toISOString().substring(0, 19);
     const errors: TaskError[] = [];
 
-    // 1. Fetch all activities from PRC_CONTACT_ACTIVITIES (source Supabase)
+    // 1. Fetch all activities from PRC_CONTACT_ACTIVITIES
     logger.info("Fetching PRC_CONTACT_ACTIVITIES...");
     const allActivities = await fetchAllActivities();
     logger.info(`${allActivities.length} total rows fetched`);
@@ -126,25 +125,7 @@ export const sendContactsToLanggraphTask = schedules.task({
     const contactIds = Object.keys(grouped);
     logger.info(`${contactIds.length} unique contacts`);
 
-    // 4. Clear destination table
-    const destDb = getSupabaseIaSales();
-    const { error: deleteError } = await destDb
-      .from("agent_ia_contact_payload")
-      .delete()
-      .neq("id", 0); // delete all rows
-
-    if (deleteError) {
-      logger.error(`Failed to clear agent_ia_contact_payload: ${deleteError.message}`);
-      errors.push({
-        type: "Supabase Clear",
-        code: "delete_failed",
-        message: deleteError.message,
-      });
-    } else {
-      logger.info("Cleared agent_ia_contact_payload table");
-    }
-
-    // 5. Process each contact
+    // 4. Send each contact to LangGraph
     let sentCount = 0;
     let errorCount = 0;
 
@@ -152,62 +133,15 @@ export const sendContactsToLanggraphTask = schedules.task({
       const activities = grouped[contactId];
 
       try {
-        // Build payload (same structure as GAS buildContactJson)
         const payload = buildContactPayload(contactId, activities);
-
-        // Insert into destination Supabase
-        const { data: insertedRow, error: insertError } = await destDb
-          .from("agent_ia_contact_payload")
-          .insert({
-            contact_hubspot_id: contactId,
-            full_name: payload.contact_info.full_name,
-            payload,
-            langgraph_status: "pending",
-            batch_id: batchId,
-          })
-          .select("id")
-          .single();
-
-        if (insertError) {
-          logger.error(`Insert failed for ${contactId}: ${insertError.message}`);
-          errors.push({
-            type: "Supabase Insert",
-            code: insertError.code ?? "insert_error",
-            message: insertError.message,
-            profile: contactId,
-          });
-          errorCount++;
-          continue;
-        }
-
-        const rowId = insertedRow?.id;
-
-        // Send to LangGraph
         const lgResult = await sendToLangGraph(payload);
 
-        // Update status in destination Supabase
         if (lgResult.success) {
-          await destDb
-            .from("agent_ia_contact_payload")
-            .update({
-              langgraph_status: "sent",
-              langgraph_run_id: lgResult.runId ?? null,
-            })
-            .eq("id", rowId);
-
           sentCount++;
           logger.info(
             `Sent ${contactId} (${payload.contact_info.full_name}) — ${payload.stats.total_activities} activities`
           );
         } else {
-          await destDb
-            .from("agent_ia_contact_payload")
-            .update({
-              langgraph_status: "error",
-              error_message: lgResult.error?.substring(0, 500),
-            })
-            .eq("id", rowId);
-
           errorCount++;
           errors.push({
             type: "LangGraph Send",
@@ -232,10 +166,10 @@ export const sendContactsToLanggraphTask = schedules.task({
       await sleep(RATE_LIMIT_BETWEEN_SENDS);
     }
 
-    // 6. Send Slack recap
+    // 5. Send Slack recap
     await sendSlackRecap(batchId, contactIds.length, sentCount, errorCount);
 
-    // 7. Send errors to script_logs
+    // 6. Send errors to script_logs
     await sendErrorToScriptLogs("Send Contacts to LangGraph", [
       {
         label: "Contacts",
