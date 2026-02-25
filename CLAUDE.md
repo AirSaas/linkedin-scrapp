@@ -31,6 +31,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
+- `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (airsaas Supabase), builds structured JSON per contact, sends to LangGraph async /runs endpoint
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
@@ -56,10 +57,11 @@ flowchart LR
         SB_O[(Supabase)]
         SL(Slack)
         ZP(Zapier)
+        LG(LangGraph API)
     end
 
     UN --> GPV[get-profil-views] & GSC[get-strategic-connections] & GSP[get-strategic-people] & GTC[get-team-connections] & ILM[import-linkedin-messages]
-    SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check]
+    SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph]
     HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM
     MJ --> SMC[sync-modjo-calls]
 
@@ -74,6 +76,7 @@ flowchart LR
     DCA --> ZP
     DFC --> SL
     SMC --> SB_O & SL
+    SCL --> LG & SL
 ```
 
 ### `get-profil-views` (daily)
@@ -317,6 +320,23 @@ flowchart TD
     H -->|Success| J[Done]
 ```
 
+### `send-contacts-to-langgraph` (cron)
+
+```mermaid
+flowchart TD
+    A([Cron]) --> B[Fetch PRC_CONTACT_ACTIVITIES<br/>from airsaas Supabase — paginé par 1000]
+    B --> C[Filtrer IS_CONTACT_IA_AGENT_ACTIVATED = true]
+    C --> D[Grouper par CONTACT_HUBSPOT_ID]
+    D --> E{Pour chaque contact}
+    E --> F[Dédupliquer activités<br/>par ACTIVITY_ID]
+    F --> G[Construire JSON payload<br/>contact_info + activities + stats]
+    G --> H[POST LangGraph /runs<br/>assistant_id: full_pipeline]
+    H -->|Success| I[Log sent]
+    H -->|Error| J[Log error]
+    E -->|All done| K{{Slack: script_logs}}
+    E -->|Errors| L{{sendErrorToScriptLogs}}
+```
+
 ## Important Rules
 
 - **Edge Function `/functions/v1/enrich`**: This is the enrichment function hosted on Supabase. **Never reinvent or replace it.** Always call it as-is with `{ parameter: "all", contact_linkedin_url: "http://linkedin.com/in/{id}" }`.
@@ -450,6 +470,12 @@ flowchart TD
 - `topics`, `tags`: string arrays
 - `raw_data`: full Modjo API response
 
+### `PRC_CONTACT_ACTIVITIES`
+- **Supabase project**: `ybgckyywiobxfsyvddtx` (airsaas) — read via `SUPABASE_URL`/`SUPABASE_KEY`
+- Contact activities synced via Airbyte, read-only
+- Fields: `CONTACT_HUBSPOT_ID`, `CONTACT_FULL_NAME`, `CONTACT` (JSON), `DEALS` (JSON), `OWNER_INTENT_HUBSPOT` (JSON), `OWNER_CONTACT_INTENT_HUBSPOT` (JSON), `SENDER` (JSON), `ACTIVITY_ID`, `ACTIVITY_TYPE`, `ACTIVITY_RECORDED_ON`, `ACTIVITY_DIRECTION`, `ACTIVITY_METADATA` (JSON), `IS_CONTACT_IA_AGENT_ACTIVATED`, `_airbyte_generation_id`
+- Used by `send-contacts-to-langgraph`
+
 ## External APIs (non-Unipile)
 
 - **LGM (LaGrowthMachine)**: `POST https://apiv2.lagrowthmachine.com/flow/leads?apikey=X` — send leads with audience name. Env var: `LGM_API_KEY`
@@ -461,6 +487,7 @@ flowchart TD
 - **Zapier Webhook** (LinkedIn messages): `POST` to `webhook_linkedin_message` — LinkedIn message enrichment
 - **Zapier Webhook** (deal clean alert): `POST` to `webhook_team_sales` — deal cleaning alerts
 - **Modjo**: `POST https://api.modjo.ai/v1/calls/exports` — export calls with transcripts, speakers, HubSpot relations. Auth: `X-API-KEY` header. Env var: `MODJO_API_KEY`
+- **LangGraph**: `POST {LANGGRAPH_BASE_URL}/runs` — async agent run with `{ assistant_id: "full_pipeline", input: { contact_data: payload } }`. Auth: `x-api-key` header. Env vars: `LANGGRAPH_BASE_URL` (prod/staging URLs differ), `LANGGRAPH_API_KEY`
 
 ## Unipile API
 
