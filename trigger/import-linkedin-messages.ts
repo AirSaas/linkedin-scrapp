@@ -585,16 +585,32 @@ async function sendToHubSpot(
   const contactDeals = await getContactDeals(contact.id);
   await sleep(RATE_LIMIT.BETWEEN_HUBSPOT_CALLS);
 
-  const associations: Record<string, unknown>[] = [
-    {
-      to: { id: contact.id },
-      types: [
-        { associationCategory: "HUBSPOT_DEFINED", associationTypeId: 81 },
-      ],
-    },
-  ];
-
+  // Validate deals exist before associating (stale/archived deals cause HTTP 400)
+  const validDeals: string[] = [];
   for (const dealId of contactDeals) {
+    try {
+      await callHubSpot(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}?properties=dealname`,
+        "GET"
+      );
+      validDeals.push(dealId);
+    } catch {
+      logger.warn(
+        `Deal ${dealId} not valid for contact ${contact.id}, skipping`
+      );
+    }
+    await sleep(RATE_LIMIT.BETWEEN_HUBSPOT_CALLS);
+  }
+
+  const contactAssociation = {
+    to: { id: contact.id },
+    types: [
+      { associationCategory: "HUBSPOT_DEFINED", associationTypeId: 81 },
+    ],
+  };
+
+  const associations: Record<string, unknown>[] = [contactAssociation];
+  for (const dealId of validDeals) {
     associations.push({
       to: { id: dealId },
       types: [
@@ -603,25 +619,39 @@ async function sendToHubSpot(
     });
   }
 
+  const commPayload = {
+    properties: {
+      hs_communication_channel_type: "LINKEDIN_MESSAGE",
+      hs_communication_logged_from: "CRM",
+      hs_communication_body: communicationBody,
+      hs_timestamp: messageRecord.message_date,
+      hubspot_owner_id: hubspotOwnerId,
+    },
+    associations,
+  };
+
   let response;
   try {
     response = await callHubSpot(
       `${HUBSPOT_API_BASE}/crm/v3/objects/communications`,
       "POST",
-      {
-        properties: {
-          hs_communication_channel_type: "LINKEDIN_MESSAGE",
-          hs_communication_logged_from: "CRM",
-          hs_communication_body: communicationBody,
-          hs_timestamp: messageRecord.message_date,
-          hubspot_owner_id: hubspotOwnerId,
-        },
-        associations,
-      }
+      commPayload
     );
   } catch (err) {
     const em = err instanceof Error ? err.message : String(err);
-    throw new Error(`Communication POST failed: ${em}`);
+    // Fallback: retry without deal associations if they caused the failure
+    if (em.includes("associations are not valid") && validDeals.length > 0) {
+      logger.warn(
+        `Retrying without deal associations for message ${messageRecord.id}`
+      );
+      response = await callHubSpot(
+        `${HUBSPOT_API_BASE}/crm/v3/objects/communications`,
+        "POST",
+        { ...commPayload, associations: [contactAssociation] }
+      );
+    } else {
+      throw new Error(`Communication POST failed: ${em}`);
+    }
   }
 
   const hsId = response.id as string | undefined;
