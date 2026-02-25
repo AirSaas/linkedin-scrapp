@@ -1,4 +1,4 @@
-import { logger, schedules } from "@trigger.dev/sdk/v3";
+import { logger, metadata, schedules } from "@trigger.dev/sdk/v3";
 import { supabase } from "./lib/supabase.js";
 import { sleep } from "./lib/utils.js";
 
@@ -214,6 +214,13 @@ export const lgmProcessIntentEventsTask = schedules.task({
         },
         intentResult.unmappedKeys
       );
+
+      metadata.set("errorCount", totalErrorCount);
+      metadata.set(
+        "errors",
+        errorDetails.map((e) => e.substring(0, 200)).slice(0, 20)
+      );
+      await metadata.flush();
     }
 
     const summary = {
@@ -318,6 +325,13 @@ export const lgmProcessIntentEvents10DaysTask = schedules.task({
         },
         intentResult.unmappedKeys
       );
+
+      metadata.set("errorCount", totalErrorCount);
+      metadata.set(
+        "errors",
+        errorDetails.map((e) => e.substring(0, 200)).slice(0, 20)
+      );
+      await metadata.flush();
     }
 
     const summary = {

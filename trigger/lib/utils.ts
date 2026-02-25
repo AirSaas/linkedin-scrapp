@@ -1,3 +1,5 @@
+import { metadata } from "@trigger.dev/sdk/v3";
+
 /**
  * Pause execution for a given number of milliseconds.
  */
@@ -178,6 +180,24 @@ export async function sendErrorToScriptLogs(
   }
 
   message += `\nTotal: ${totalErrors} erreurs`;
+
+  // Expose errors in Trigger.dev run metadata (visible in dashboard + API)
+  try {
+    const errorSummary = groups
+      .flatMap((g) =>
+        g.errors.map((e) => ({
+          type: e.type,
+          code: e.code,
+          message: e.message.substring(0, 200),
+        }))
+      )
+      .slice(0, 20);
+    metadata.set("errorCount", totalErrors);
+    metadata.set("errors", errorSummary);
+    await metadata.flush();
+  } catch {
+    // metadata may not be available outside task context
+  }
 
   try {
     await fetch(webhookUrl, {
