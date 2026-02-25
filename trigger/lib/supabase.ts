@@ -12,6 +12,18 @@ export function getSupabase(): SupabaseClient {
   return _supabase;
 }
 
+let _supabaseIaSales: SupabaseClient | null = null;
+
+export function getSupabaseIaSales(): SupabaseClient {
+  if (!_supabaseIaSales) {
+    _supabaseIaSales = createClient(
+      process.env.SUPABASE_IA_SALES_URL!,
+      process.env.SUPABASE_IA_SALES_KEY!
+    );
+  }
+  return _supabaseIaSales;
+}
+
 /**
  * @deprecated Use getSupabase() instead — kept for backward compatibility.
  */
