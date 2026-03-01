@@ -16,10 +16,17 @@ const LAST_VIEWED_HOURS = 72;
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_CONCURRENT ?? "";
 
-const ENRICH_URL =
-  "https://ybgckyywiobxfsyvddtx.supabase.co/functions/v1/enrich";
-const ENRICH_TOKEN =
-  "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InliZ2NreXl3aW9ieGZzeXZkZHR4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzI1MjEwOTcsImV4cCI6MjA0ODA5NzA5N30.2VlgA93X5Qesfkq9C9S4GKe_2OUeCjCgc_W3Vd0ufPo";
+function getEnrichUrl(): string {
+  const base = process.env.SUPABASE_URL;
+  if (!base) throw new Error("SUPABASE_URL env var is not set");
+  return `${base}/functions/v1/enrich`;
+}
+
+function getEnrichToken(): string {
+  const key = process.env.SUPABASE_KEY;
+  if (!key) throw new Error("SUPABASE_KEY env var is not set");
+  return `Bearer ${key}`;
+}
 
 // Single account: bertranruiz
 const GHOST_GENIUS_ACCOUNT_ID = "77afde07-9ff8-4a78-a067-e8357a99a843";
@@ -334,10 +341,10 @@ async function fetchNewProfiles(
 // ENRICH VIA SUPABASE EDGE FUNCTION
 // ============================================
 async function callEnrichFunction(publicIdentifier: string): Promise<any> {
-  const res = await fetch(ENRICH_URL, {
+  const res = await fetch(getEnrichUrl(), {
     method: "POST",
     headers: {
-      Authorization: ENRICH_TOKEN,
+      Authorization: getEnrichToken(),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
