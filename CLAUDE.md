@@ -32,8 +32,12 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
 - `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (airsaas Supabase), builds structured JSON per contact, sends to LangGraph async /runs endpoint
+- `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
+- `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
+- `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
+- `trigger/lib/crisp-supabase.ts` — Supabase client for tchat-support-sync project `oqiowupiczgrezgyopfm` (lazy-init, dedicated env vars)
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
 
 ## Task Flow Diagrams
@@ -49,12 +53,14 @@ flowchart LR
         SB[(Supabase)]
         HS_I(HubSpot API)
         MJ(Modjo API)
+        CR(Crisp API)
     end
 
     subgraph dst ["Destinations"]
         LGM_O(LGM API)
         HS_O(HubSpot API)
         SB_O[(Supabase)]
+        SB_CR[(Supabase tchat-support-sync)]
         SL(Slack)
         ZP(Zapier)
         LG(LangGraph API)
@@ -64,6 +70,7 @@ flowchart LR
     SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph]
     HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM
     MJ --> SMC[sync-modjo-calls]
+    CR --> BCS[batch-crisp-to-supabase] & SCS[sync-crisp-to-supabase]
 
     GPV --> SB_O & SL
     GSC --> SB_O & SL
@@ -77,6 +84,8 @@ flowchart LR
     DFC --> SL
     SMC --> SB_O & SL
     SCL --> LG & SL
+    BCS --> SB_CR & SL
+    SCS --> SB_CR & SL
 ```
 
 ### `get-profil-views` (daily)
@@ -337,6 +346,43 @@ flowchart TD
     E -->|Errors| L{{sendErrorToScriptLogs}}
 ```
 
+### `batch-crisp-to-supabase` (manual)
+
+```mermaid
+flowchart TD
+    A([Manual trigger]) --> B[Payload: startPage, maxPages, maxRequests]
+    B --> C{For each page}
+    C --> D[listConversations — 1 req Crisp]
+    D --> E[classifyConversations — 1 SELECT Supabase]
+    E --> F{For each conversation}
+    F -->|Unchanged| G[Skip]
+    F -->|New| H[Fetch metas + all messages<br/>2+ req Crisp]
+    H --> I[Upsert conversation<br/>+ batch insert messages]
+    F -->|Updated| J[Fetch all messages<br/>1+ req Crisp]
+    J --> K[Batch upsert messages<br/>+ update conversation]
+    C -->|3 empty pages| L[Stop]
+    C -->|Rate limit| M[Stop]
+    C -->|All done| N{{Slack: script_logs if errors}}
+```
+
+### `sync-crisp-to-supabase` (cron)
+
+```mermaid
+flowchart TD
+    A([Cron via dashboard]) --> B[Read cursor from tchat_sync_cursor]
+    B --> C{Paginate conversations<br/>max 5 pages}
+    C --> D{For each conversation<br/>updated_at > cursor}
+    D -->|Older than cursor| E[Stop pagination]
+    D -->|Recent| F[Fetch metas + messages<br/>2 req Crisp]
+    F --> G{For each message}
+    G --> H{Exists by fingerprint?}
+    H -->|Yes| I[Skip]
+    H -->|No| J[Insert message]
+    J --> K[Update conversation counters]
+    C -->|All done| L[Update cursor]
+    L --> M{{Slack: script_logs if errors}}
+```
+
 ## Important Rules
 
 - **Edge Function `/functions/v1/enrich`**: This is the enrichment function hosted on Supabase. **Never reinvent or replace it.** Always call it as-is with `{ parameter: "all", contact_linkedin_url: "http://linkedin.com/in/{id}" }`.
@@ -476,6 +522,30 @@ flowchart TD
 - Fields: `CONTACT_HUBSPOT_ID`, `CONTACT_FULL_NAME`, `CONTACT` (JSON), `DEALS` (JSON), `OWNER_INTENT_HUBSPOT` (JSON), `OWNER_CONTACT_INTENT_HUBSPOT` (JSON), `SENDER` (JSON), `ACTIVITY_ID`, `ACTIVITY_TYPE`, `ACTIVITY_RECORDED_ON`, `ACTIVITY_DIRECTION`, `ACTIVITY_METADATA` (JSON), `IS_CONTACT_IA_AGENT_ACTIVATED`, `_airbyte_generation_id`
 - Used by `send-contacts-to-langgraph`
 
+### `tchat_conversations`
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync) — via `TCHAT_SUPPORT_SYNC_SUPABASE_URL`/`TCHAT_SUPPORT_SYNC_SUPABASE_SERVICE_KEY`
+- Crisp conversations (from `batch-crisp-to-supabase` and `sync-crisp-to-supabase`)
+- PK: `session_id` (Crisp session ID)
+- `website_id`, `contact_email`, `contact_name`, `state` (pending/unresolved/resolved)
+- `message_count_inbound`, `message_count_outbound`, `first_message_at`, `last_message_at`
+- `metadata`: JSON (Crisp meta object)
+
+### `tchat_messages`
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
+- Crisp messages (from `batch-crisp-to-supabase` and `sync-crisp-to-supabase`)
+- Unique on: `fingerprint` (Crisp message fingerprint)
+- `session_id`: references `tchat_conversations.session_id`
+- `direction`: INBOUND (user) / OUTBOUND (operator)
+- `content_type`: text, file, note, etc.
+- `crisp_timestamp`: original Crisp timestamp
+- `raw_data`: full Crisp message object
+
+### `tchat_sync_cursor`
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
+- Sync cursor for incremental sync (from `sync-crisp-to-supabase`)
+- PK: `website_id`
+- `last_synced_at`: ISO timestamp of last synced conversation
+
 ## External APIs (non-Unipile)
 
 - **LGM (LaGrowthMachine)**: `POST https://apiv2.lagrowthmachine.com/flow/leads?apikey=X` — send leads with audience name. Env var: `LGM_API_KEY`
@@ -488,6 +558,7 @@ flowchart TD
 - **Zapier Webhook** (deal clean alert): `POST` to `webhook_team_sales` — deal cleaning alerts
 - **Modjo**: `POST https://api.modjo.ai/v1/calls/exports` — export calls with transcripts, speakers, HubSpot relations. Auth: `X-API-KEY` header. Env var: `MODJO_API_KEY`
 - **LangGraph**: `POST {LANGGRAPH_BASE_URL}/runs` — async agent run with `{ assistant_id: "full_pipeline", input: { contact_data: payload } }`. Auth: `x-api-key` header. Env vars: `LANGGRAPH_BASE_URL` (prod/staging URLs differ), `LANGGRAPH_API_KEY`
+- **Crisp**: `GET/POST https://api.crisp.chat/v1/website/{websiteId}/...` — conversations, messages, metas. Auth: HTTP Basic (`CRISP_IDENTIFIER:CRISP_KEY`), header `X-Crisp-Tier: plugin`. Rate limit: 500 req/24h. Env vars: `CRISP_IDENTIFIER`, `CRISP_KEY`, `CRISP_WEBSITE_ID`
 
 ## Unipile API
 
