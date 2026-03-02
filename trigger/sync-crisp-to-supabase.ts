@@ -25,12 +25,12 @@ import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
  *   - Insert les nouveaux messages (dédup par fingerprint)
  * - Met à jour le curseur
  *
- * Consommation: ~2-5 req/run en temps normal
- * Cron configuré via le dashboard Trigger.dev
+ * Consommation: ~2-10 req/run en temps normal (horaire)
+ * Cron configuré via le dashboard Trigger.dev (toutes les heures)
  */
 export const syncCrispToSupabase = schedules.task({
   id: "sync-crisp-to-supabase",
-  maxDuration: 120,
+  maxDuration: 300,
 
   run: async () => {
     const startTime = Date.now();
@@ -47,7 +47,7 @@ export const syncCrispToSupabase = schedules.task({
       let latestTimestamp = cursorDate;
       let page = 1;
 
-      while (page <= 5) {
+      while (page <= 10) {
         const conversations = await listConversations(page);
         if (!conversations.length) break;
 
