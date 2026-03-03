@@ -75,6 +75,13 @@ interface CrispApiResponse<T> {
   data: T;
 }
 
+export class CrispApiError extends Error {
+  constructor(public statusCode: number | null, message: string) {
+    super(message);
+    this.name = "CrispApiError";
+  }
+}
+
 // ============================================
 // Compteur de requêtes (rate limit 500/24h)
 // ============================================
@@ -98,45 +105,36 @@ export function isRateLimited(): boolean {
 // Fetch wrapper
 // ============================================
 
-async function crispFetch<T>(path: string): Promise<T | null> {
+async function crispFetch<T>(path: string): Promise<T> {
   if (isRateLimited()) {
-    logger.warn(`Rate limit atteint (${requestCount}/${REQUEST_LIMIT}), arrêt`);
-    return null;
+    throw new CrispApiError(429, `Rate limit atteint (${requestCount}/${REQUEST_LIMIT})`);
   }
 
   const url = `${CRISP_BASE}${path}`;
   requestCount++;
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        Authorization: getAuthHeader(),
-        "X-Crisp-Tier": "plugin",
-      },
-    });
+  const response = await fetch(url, {
+    headers: {
+      Authorization: getAuthHeader(),
+      "X-Crisp-Tier": "plugin",
+    },
+  });
 
-    if (response.status === 429) {
-      logger.error("Crisp 429 Too Many Requests");
-      return null;
-    }
-
-    if (!response.ok) {
-      const body = await response.text();
-      logger.error(`Crisp API error ${response.status}`, { url, body });
-      return null;
-    }
-
-    const json: CrispApiResponse<T> = await response.json();
-    if (json.error) {
-      logger.error("Crisp API error", { reason: json.reason, url });
-      return null;
-    }
-
-    return json.data;
-  } catch (error) {
-    logger.error("Crisp fetch error", { url, error });
-    return null;
+  if (response.status === 429) {
+    throw new CrispApiError(429, "Crisp 429 Too Many Requests");
   }
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new CrispApiError(response.status, `Crisp API error ${response.status}: ${body}`);
+  }
+
+  const json: CrispApiResponse<T> = await response.json();
+  if (json.error) {
+    throw new CrispApiError(null, `Crisp API error: ${json.reason}`);
+  }
+
+  return json.data;
 }
 
 // ============================================
@@ -146,37 +144,50 @@ async function crispFetch<T>(path: string): Promise<T | null> {
 /**
  * Liste les conversations (paginé, 20 par page)
  * Page 1-indexed
+ *
+ * THROWS CrispApiError on API failure — callers must handle it
+ * to distinguish empty pages from API errors.
  */
 export async function listConversations(page: number = 1): Promise<CrispConversation[]> {
-  const data = await crispFetch<CrispConversation[]>(
+  return await crispFetch<CrispConversation[]>(
     `/website/${getWebsiteId()}/conversations/${page}`
   );
-  return data || [];
 }
 
 /**
  * Récupère les metas d'une conversation (email, nom, etc.)
+ * Returns null on error (per-conversation errors are non-fatal).
  */
 export async function getConversationMetas(sessionId: string): Promise<CrispConversation["meta"] | null> {
-  return crispFetch<CrispConversation["meta"]>(
-    `/website/${getWebsiteId()}/conversation/${sessionId}/meta`
-  );
+  try {
+    return await crispFetch<CrispConversation["meta"]>(
+      `/website/${getWebsiteId()}/conversation/${sessionId}/meta`
+    );
+  } catch (err) {
+    logger.error("getConversationMetas error", { sessionId, error: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
 }
 
 /**
  * Récupère les messages d'une conversation
  * timestampBefore: pour la pagination (messages avant ce timestamp)
+ * Returns [] on error (per-conversation errors are non-fatal).
  */
 export async function getMessages(
   sessionId: string,
   timestampBefore?: number
 ): Promise<CrispMessage[]> {
-  let path = `/website/${getWebsiteId()}/conversation/${sessionId}/messages`;
-  if (timestampBefore) {
-    path += `?timestamp_before=${timestampBefore}`;
+  try {
+    let path = `/website/${getWebsiteId()}/conversation/${sessionId}/messages`;
+    if (timestampBefore) {
+      path += `?timestamp_before=${timestampBefore}`;
+    }
+    return await crispFetch<CrispMessage[]>(path);
+  } catch (err) {
+    logger.error("getMessages error", { sessionId, error: err instanceof Error ? err.message : String(err) });
+    return [];
   }
-  const data = await crispFetch<CrispMessage[]>(path);
-  return data || [];
 }
 
 /**
