@@ -5,6 +5,7 @@ import {
   getAllMessages,
   getRequestCount,
   isRateLimited,
+  CrispApiError,
 } from "./lib/crisp.js";
 import {
   upsertConversation,
@@ -66,7 +67,17 @@ export const batchCrispToSupabase = task({
         break;
       }
 
-      const conversations = await listConversations(page);
+      let conversations: Awaited<ReturnType<typeof listConversations>>;
+      try {
+        conversations = await listConversations(page);
+      } catch (err) {
+        if (err instanceof CrispApiError) {
+          logger.error(`Crisp API error on page ${page}, arrêt du batch`, { error: err.message, statusCode: err.statusCode });
+          errors.push({ type: "CrispAPI", code: String(err.statusCode ?? "unknown"), message: err.message });
+          break;
+        }
+        throw err;
+      }
 
       if (!conversations.length) {
         emptyPages++;
