@@ -33,6 +33,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
 - `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (airsaas Supabase), builds structured JSON per contact, sends to LangGraph async /runs endpoint
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
+- `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
@@ -70,7 +71,7 @@ flowchart LR
     SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph]
     HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM
     MJ --> SMC[sync-modjo-calls]
-    CR --> BCS[batch-crisp-to-supabase] & SCS[sync-crisp-to-supabase]
+    CR --> BCS[batch-crisp-to-supabase] & DBCS[daily-batch-crisp TMP] & SCS[sync-crisp-to-supabase]
 
     GPV --> SB_O & SL
     GSC --> SB_O & SL
@@ -85,6 +86,7 @@ flowchart LR
     SMC --> SB_O & SL
     SCL --> LG & SL
     BCS --> SB_CR & SL
+    DBCS --> SB_CR & SL
     SCS --> SB_CR & SL
 ```
 
@@ -365,6 +367,28 @@ flowchart TD
     C -->|All done| N{{Slack: script_logs if errors}}
 ```
 
+### `daily-batch-crisp-to-supabase` (hourly cron, 25h gap — TEMPORARY)
+
+```mermaid
+flowchart TD
+    A([Cron hourly]) --> B[Read tchat_batch_cursor_tmp]
+    B --> C{is_done?}
+    C -->|Yes| D[Skip]
+    C -->|No| E{25h+ since<br/>last_run_at?}
+    E -->|No| F[Skip]
+    E -->|Yes| G[Run batch from next_page]
+    G --> H{For each page}
+    H --> I[listConversations + classifyConversations]
+    I --> J{Process new/updated}
+    J --> K[Fetch metas + messages<br/>Upsert to Supabase]
+    H -->|3 empty pages| L[Mark is_done = true]
+    H -->|Rate limit 400 req| M[Save next_page]
+    H -->|All done| M
+    L --> N[Update cursor]
+    M --> N
+    N --> O{{Slack: script_logs if errors}}
+```
+
 ### `sync-crisp-to-supabase` (cron)
 
 ```mermaid
@@ -545,6 +569,15 @@ flowchart TD
 - Sync cursor for incremental sync (from `sync-crisp-to-supabase`)
 - PK: `website_id`
 - `last_synced_at`: ISO timestamp of last synced conversation
+
+### `tchat_batch_cursor_tmp` (TEMPORARY)
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
+- **À SUPPRIMER** une fois l'import historique Crisp terminé (quand `is_done = true`)
+- Batch cursor for `daily-batch-crisp-to-supabase`
+- PK: `website_id`
+- `next_page`: next Crisp page to import
+- `last_run_at`: ISO timestamp of last actual batch execution (used for 25h gap check)
+- `is_done`: true when 3 empty pages found (no more conversations to import)
 
 ## External APIs (non-Unipile)
 

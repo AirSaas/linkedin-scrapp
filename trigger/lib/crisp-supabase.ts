@@ -209,6 +209,51 @@ export async function updateCursor(
 }
 
 // ============================================
+// Curseur batch (table temporaire tchat_batch_cursor_tmp)
+// ============================================
+
+export interface BatchCursor {
+  nextPage: number;
+  lastRunAt: string | null;
+  isDone: boolean;
+}
+
+export async function getBatchCursor(): Promise<BatchCursor> {
+  const { data } = await getCrispSupabase()
+    .from("tchat_batch_cursor_tmp")
+    .select("next_page, last_run_at, is_done")
+    .eq("website_id", getWebsiteId())
+    .single();
+
+  if (!data) {
+    return { nextPage: 1, lastRunAt: null, isDone: false };
+  }
+  return {
+    nextPage: data.next_page,
+    lastRunAt: data.last_run_at,
+    isDone: data.is_done,
+  };
+}
+
+export async function updateBatchCursor(
+  nextPage: number,
+  isDone: boolean
+): Promise<void> {
+  await getCrispSupabase()
+    .from("tchat_batch_cursor_tmp")
+    .upsert(
+      {
+        website_id: getWebsiteId(),
+        next_page: nextPage,
+        last_run_at: new Date().toISOString(),
+        is_done: isDone,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "website_id" }
+    );
+}
+
+// ============================================
 // Stats
 // ============================================
 
