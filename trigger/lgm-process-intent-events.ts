@@ -111,6 +111,7 @@ interface IntentEvent {
 }
 
 interface ConcurrentContact {
+  linkedin_private_id?: string;
   first_name?: string;
   last_name?: string;
   linkedin_profile_url?: string;
@@ -424,8 +425,18 @@ async function getConcurrentContacts(lookbackDays = 1): Promise<ConcurrentContac
     );
   }
 
-  logger.info(`${(data ?? []).length} concurrent contacts found`);
-  return (data ?? []) as ConcurrentContact[];
+  // Dedup by linkedin_private_id: a contact can appear in multiple Sales Nav searches
+  const all = (data ?? []) as ConcurrentContact[];
+  const seen = new Set<string>();
+  const unique = all.filter((c) => {
+    const id = c.linkedin_private_id;
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+
+  logger.info(`${all.length} concurrent contacts found (${unique.length} unique after dedup)`);
+  return unique;
 }
 
 async function getHubspotIdFromPrcContacts(
