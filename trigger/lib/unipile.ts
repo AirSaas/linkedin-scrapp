@@ -133,4 +133,28 @@ export const unipile = {
    */
   getChatAttendees: (chatId: string) =>
     request("GET", `/chats/${chatId}/attendees`),
+
+  /**
+   * List emails for an account (Gmail, etc.).
+   * GET /emails?account_id={accountId}&role={role}&after={after}&before={before}&limit={limit}&cursor={cursor}
+   * Requires a GOOGLE_OAUTH or IMAP account (not a LINKEDIN account).
+   */
+  getEmails: (
+    accountId: string,
+    options?: {
+      limit?: number;
+      cursor?: string;
+      folder?: string;
+      after?: string;
+      before?: string;
+    }
+  ) => {
+    let path = `/emails?account_id=${accountId}`;
+    if (options?.limit) path += `&limit=${options.limit}`;
+    if (options?.cursor) path += `&cursor=${options.cursor}`;
+    if (options?.folder) path += `&folder=${options.folder}`;
+    if (options?.after) path += `&after=${options.after}`;
+    if (options?.before) path += `&before=${options.before}`;
+    return request("GET", path);
+  },
 };

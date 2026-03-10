@@ -28,6 +28,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/hubspot-cleanup-email-associations.ts` — removes parasitic email-contact associations in HubSpot (emails with >3 contacts where contact not in from/to/cc/bcc)
 - `trigger/import-linkedin-messages.ts` — imports LinkedIn messages from last 24h via Unipile → Supabase, sends 1:1 messages to HubSpot (communication) + Zapier webhook
 - `trigger/weekly-meetings-recap.ts` — weekly Monday recap of HubSpot meetings in SQL pipeline, enriched with AI (Anthropic Sonnet) and sent to Slack
+- `trigger/weekly-unanswered-recap.ts` — weekly Friday 8h30 recap of unanswered LinkedIn messages (all team) + Gmail emails (Bertran) with AI classification (Claude Sonnet) to filter spam/noise, posted to Slack via `webhook_unanswered_recap`
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
@@ -35,7 +36,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
-- `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees)
+- `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
 - `trigger/lib/crisp-supabase.ts` — Supabase client for tchat-support-sync project `oqiowupiczgrezgyopfm` (lazy-init, dedicated env vars)
@@ -72,6 +73,8 @@ flowchart LR
     HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM
     MJ --> SMC[sync-modjo-calls]
     CR --> BCS[batch-crisp-to-supabase] & DBCS[daily-batch-crisp TMP] & SCS[sync-crisp-to-supabase]
+    SB --> WUR[weekly-unanswered-recap]
+    UN --> WUR
 
     GPV --> SB_O & SL
     GSC --> SB_O & SL
@@ -88,6 +91,7 @@ flowchart LR
     BCS --> SB_CR & SL
     DBCS --> SB_CR & SL
     SCS --> SB_CR & SL
+    WUR --> SL
 ```
 
 ### `get-profil-views` (daily)
@@ -405,6 +409,39 @@ flowchart TD
     J --> K[Update conversation counters]
     C -->|All done| L[Update cursor]
     L --> M{{Slack: script_logs if errors}}
+```
+
+### `weekly-unanswered-recap` (weekly Friday 8h30)
+
+```mermaid
+flowchart TD
+    A([Cron vendredi 8h30]) --> B[Fetch workspace_team]
+
+    B --> C{Pour chaque membre}
+    C --> D[Supabase: scrapped_linkedin_threads<br/>1:1, last_activity >= lundi]
+    D --> E[Supabase: scrapped_linkedin_messages<br/>derniers messages par thread]
+    E --> F{Dernier msg sender<br/>= membre ?}
+    F -->|Oui| G[Skip: déjà répondu]
+    F -->|Non| H[Ajouter à liste<br/>LinkedIn non répondus]
+
+    B --> I[Pour chaque EMAIL_RECAP_ACCOUNT:<br/>Unipile getEmails<br/>role=inbox + role=sent<br/>after=lundi before=vendredi]
+    I --> J[Grouper par thread_id<br/>Exclure CATEGORY_PROMOTIONS etc.]
+    J --> K{thread_id dans<br/>emails SENT ?}
+    K -->|Oui| L[Skip: répondu]
+    K -->|Non| M[Ajouter à liste<br/>Email non répondus]
+
+    H & M --> N[Claude Sonnet:<br/>classifier important vs spam<br/>batches de 10]
+    N -->|spam| O[Filtrer]
+    N -->|important| P[Garder]
+
+    P --> Q{Source = email ?}
+    Q -->|Oui| R[HubSpot: chercher<br/>LinkedIn par email]
+    Q -->|Non| S[LinkedIn URL<br/>depuis sender_data]
+
+    R & S --> T[Construire message Slack<br/>groupé par membre]
+    T --> U{{Slack API: chat.postMessage<br/>channel C032ZPKB51S}}
+
+    C -->|Erreurs| V{{sendErrorToScriptLogs}}
 ```
 
 ## Important Rules
