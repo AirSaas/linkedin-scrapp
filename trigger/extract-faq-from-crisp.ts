@@ -276,13 +276,16 @@ Extrais les entrées FAQ en JSON :
 }]`;
 
   const createMessage = async () => {
-    const message = await client.messages.create({
+    // Use streaming to avoid SDK timeout on long Opus requests
+    const stream = client.messages.stream({
       model: MODEL,
       max_tokens: MAX_TOKENS,
       temperature: TEMPERATURE,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: userPrompt }],
     });
+
+    const message = await stream.finalMessage();
 
     const textBlock = message.content.find((b) => b.type === "text");
     if (!textBlock || textBlock.type !== "text") {
