@@ -1,6 +1,6 @@
 import { logger, metadata, task } from "@trigger.dev/sdk/v3";
 import Anthropic from "@anthropic-ai/sdk";
-import { sleep, sendErrorToScriptLogs, type TaskError, type TaskResultGroup } from "./lib/utils.js";
+import { sendErrorToScriptLogs, type TaskError, type TaskResultGroup } from "./lib/utils.js";
 import {
   getFaqCursor,
   updateFaqCursor,
@@ -14,9 +14,9 @@ import {
 // ============================================
 
 const BATCH_SIZE = 10;
-const SLEEP_BETWEEN_CONVERSATIONS_MS = 30_000;
+const DELAY_BETWEEN_CHILDREN_S = 30;
 const MODEL = "claude-opus-4-20250514";
-const MAX_TOKENS = 4000;
+const MAX_TOKENS = 16000;
 const TEMPERATURE = 0.3;
 
 // ============================================
@@ -64,14 +64,66 @@ RÈGLES :
 Réponds UNIQUEMENT en JSON valide, un tableau d'objets. Pas de markdown, pas de backticks, pas de commentaires.`;
 
 // ============================================
-// TASK
+// CHILD TASK: process a single conversation
+// ============================================
+
+export const extractFaqSingleConversation = task({
+  id: "extract-faq-single-conversation",
+  maxDuration: 300, // 5 min max per conversation
+  run: async (payload: { sessionId: string; contactName: string | null; firstMessageAt: string; lastMessageAt: string }) => {
+    const label = `${payload.contactName || "unknown"} (${payload.sessionId.slice(0, 12)}...)`;
+    logger.info(`Processing conversation: ${label}`);
+
+    // 1. Fetch messages (only < 1 year old)
+    const messages = await getMessagesForConversation(payload.sessionId);
+    const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+    const recentMessages = messages.filter((m) => m.crisp_timestamp >= oneYearAgo);
+
+    if (recentMessages.length < 3) {
+      logger.info(`Skipping ${label}: only ${recentMessages.length} recent messages`);
+      return { skipped: true, reason: "too_few_messages", messageCount: recentMessages.length };
+    }
+
+    // 2. Build transcript
+    const transcript = buildTranscript(recentMessages);
+    logger.info(`Transcript: ${recentMessages.length} messages, ${transcript.length} chars`);
+
+    // 3. Call Claude
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const extractions = await callClaude(client, payload, transcript);
+
+    // 4. Save
+    await upsertFaqExtraction(
+      payload.sessionId,
+      payload.contactName,
+      payload.firstMessageAt,
+      extractions,
+      MODEL
+    );
+
+    const faqCount = extractions.filter((e) => ((e as Record<string, unknown>).faq_score as number ?? 0) >= 3).length;
+    logger.info(`${label}: ${extractions.length} entries extracted (${faqCount} with score >= 3)`);
+
+    return {
+      sessionId: payload.sessionId,
+      contactName: payload.contactName,
+      entriesExtracted: extractions.length,
+      faqScore3Plus: faqCount,
+      messageCount: recentMessages.length,
+      transcriptLength: transcript.length,
+    };
+  },
+});
+
+// ============================================
+// ORCHESTRATOR TASK: batch + fire-and-forget children
 // ============================================
 
 export const extractFaqFromCrisp = task({
   id: "extract-faq-from-crisp",
-  maxDuration: 600, // 10 min max per batch
+  maxDuration: 60, // Orchestrator is fast — just triggers children
   run: async () => {
-    logger.info("=== START extract-faq-from-crisp ===");
+    logger.info("=== START extract-faq-from-crisp (orchestrator) ===");
 
     // 1. Read cursor
     const cursor = await getFaqCursor();
@@ -83,7 +135,7 @@ export const extractFaqFromCrisp = task({
     const offset = cursor.lastProcessedOffset;
     logger.info(`Starting from offset ${offset}`);
 
-    // 2. Fetch conversations (fetch more than BATCH_SIZE to account for filtering)
+    // 2. Fetch conversations
     const conversations = await getConversationsForFaq(offset, BATCH_SIZE + 10);
 
     if (conversations.length === 0) {
@@ -94,115 +146,52 @@ export const extractFaqFromCrisp = task({
     }
 
     const batch = conversations.slice(0, BATCH_SIZE);
-    logger.info(`Processing ${batch.length} conversations (offset ${offset})`);
+    logger.info(`Triggering ${batch.length} child tasks (offset ${offset})`);
 
-    // 3. Process each conversation
-    const errors: TaskError[] = [];
-    let processed = 0;
-    let extracted = 0;
+    // 3. Fire-and-forget: trigger each child with staggered delay
+    const triggered: string[] = [];
+    for (let i = 0; i < batch.length; i++) {
+      const convo = batch[i];
+      const delaySeconds = i * DELAY_BETWEEN_CHILDREN_S;
 
-    const client = new Anthropic({
-      apiKey: process.env.ANTHROPIC_API_KEY,
-    });
+      const handle = await extractFaqSingleConversation.trigger(
+        {
+          sessionId: convo.session_id,
+          contactName: convo.contact_name,
+          firstMessageAt: convo.first_message_at,
+          lastMessageAt: convo.last_message_at,
+        },
+        delaySeconds > 0 ? { delay: `${delaySeconds}s` } : undefined
+      );
 
-    for (const convo of batch) {
-      const label = `${convo.contact_name || "unknown"} (${convo.session_id.slice(0, 12)}...)`;
-
-      try {
-        // Fetch all messages
-        const messages = await getMessagesForConversation(convo.session_id);
-        if (messages.length < 3) {
-          logger.info(`Skipping ${label}: only ${messages.length} messages`);
-          processed++;
-          continue;
-        }
-
-        // Build transcript
-        const transcript = buildTranscript(messages);
-
-        // Call Claude
-        const extractions = await callClaude(client, convo, transcript);
-
-        // Save
-        await upsertFaqExtraction(
-          convo.session_id,
-          convo.contact_name,
-          convo.first_message_at,
-          extractions,
-          MODEL
-        );
-
-        const faqCount = extractions.filter((e) => ((e as Record<string, unknown>).faq_score as number ?? 0) >= 3).length;
-        logger.info(`${label}: ${extractions.length} entries extracted (${faqCount} with score >= 3)`);
-        processed++;
-        extracted += extractions.length;
-
-        // Sleep between conversations (except last one)
-        if (batch.indexOf(convo) < batch.length - 1) {
-          await sleep(SLEEP_BETWEEN_CONVERSATIONS_MS);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(`Error processing ${label}: ${msg}`);
-        errors.push({
-          type: "FAQ Extraction",
-          code: "exception",
-          message: `${label}: ${msg}`,
-        });
-        processed++;
-      }
+      triggered.push(`${convo.contact_name || "unknown"} (delay ${delaySeconds}s, run ${handle.id})`);
+      logger.info(`Triggered child ${i + 1}/${batch.length}: ${convo.contact_name || "unknown"} — delay ${delaySeconds}s`);
     }
 
     // 4. Update cursor
     const newOffset = offset + batch.length;
-    await updateFaqCursor(newOffset, false, conversations.length < BATCH_SIZE ? newOffset : undefined);
+    await updateFaqCursor(newOffset, false);
 
-    // 5. Report errors
-    if (errors.length > 0) {
-      const groups: TaskResultGroup[] = [
-        {
-          label: "FAQ Extraction",
-          inserted: extracted,
-          skipped: processed - extracted,
-          errors,
-        },
-      ];
-      await sendErrorToScriptLogs("Extract FAQ from Crisp", groups);
-    }
+    // 5. Chain next orchestrator batch (with delay to let children finish)
+    const totalDelayS = batch.length * DELAY_BETWEEN_CHILDREN_S + 60; // children + buffer
+    logger.info(`Triggering next orchestrator batch in ${totalDelayS}s`);
+    await extractFaqFromCrisp.trigger(undefined, { delay: `${totalDelayS}s` });
 
     // 6. Expose metadata
     try {
-      if (errors.length > 0) {
-        metadata.set("errorCount", errors.length);
-        metadata.set(
-          "errors",
-          errors.map((e) => ({
-            type: e.type,
-            code: e.code,
-            message: e.message.substring(0, 200),
-          }))
-        );
-      }
-      metadata.set("processed", processed);
-      metadata.set("extracted", extracted);
       metadata.set("offset", newOffset);
+      metadata.set("triggered", batch.length);
+      metadata.set("nextBatchDelay", `${totalDelayS}s`);
       await metadata.flush();
     } catch {
       // metadata may not be available
     }
 
-    logger.info(`Batch done: ${processed} processed, ${extracted} FAQ entries, ${errors.length} errors. New offset: ${newOffset}`);
-
-    // 7. Chain next batch
-    logger.info("Triggering next batch...");
-    await extractFaqFromCrisp.trigger();
-
     return {
-      processed,
-      extracted,
-      errors: errors.length,
-      newOffset,
-      chainedNext: true,
+      offset: newOffset,
+      triggered: batch.length,
+      children: triggered,
+      nextBatchIn: `${totalDelayS}s`,
     };
   },
 });
@@ -237,7 +226,6 @@ function buildTranscript(messages: Message[]): string {
     if (msg.content_type === "note") {
       lines.push(`[${time}] [NOTE INTERNE] ${sender}: ${msg.content}`);
     } else if (msg.content_type === "file") {
-      // File messages: content is often JSON with URL/name
       let fileName = "fichier";
       try {
         const parsed = JSON.parse(msg.content);
@@ -247,7 +235,6 @@ function buildTranscript(messages: Message[]): string {
       }
       lines.push(`[${time}] [FICHIER: ${fileName}] ${sender}`);
     } else if (msg.content_type === "event") {
-      // Skip system events
       continue;
     } else {
       const prefix = msg.direction === "INBOUND" ? "[CLIENT]" : "[SUPPORT]";
@@ -260,13 +247,13 @@ function buildTranscript(messages: Message[]): string {
 
 async function callClaude(
   client: Anthropic,
-  convo: { contact_name: string | null; first_message_at: string; last_message_at: string },
+  convo: { contactName: string | null; firstMessageAt: string; lastMessageAt: string },
   transcript: string
 ): Promise<unknown[]> {
-  const firstDate = new Date(convo.first_message_at).toLocaleDateString("fr-FR");
-  const lastDate = new Date(convo.last_message_at).toLocaleDateString("fr-FR");
+  const firstDate = new Date(convo.firstMessageAt).toLocaleDateString("fr-FR");
+  const lastDate = new Date(convo.lastMessageAt).toLocaleDateString("fr-FR");
 
-  const userPrompt = `Conversation support avec ${convo.contact_name || "client inconnu"} — du ${firstDate} au ${lastDate}
+  const userPrompt = `Conversation support avec ${convo.contactName || "client inconnu"} — du ${firstDate} au ${lastDate}
 
 ${transcript}
 
@@ -288,7 +275,7 @@ Extrais les entrées FAQ en JSON :
   "file_references": ["..."]
 }]`;
 
-  try {
+  const createMessage = async () => {
     const message = await client.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
@@ -303,7 +290,6 @@ Extrais les entrées FAQ en JSON :
       return [];
     }
 
-    // Parse JSON — handle potential markdown wrapping
     let jsonText = textBlock.text.trim();
     if (jsonText.startsWith("```")) {
       jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
@@ -316,36 +302,18 @@ Extrais les entrées FAQ en JSON :
     }
 
     return parsed;
+  };
+
+  try {
+    return await createMessage();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`Claude API error, retrying in 5s: ${msg}`);
 
-    // Retry once after 2s
-    logger.warn(`Claude API error, retrying in 2s: ${msg}`);
-    await sleep(2000);
+    await new Promise((r) => setTimeout(r, 5000));
 
-    try {
-      const message = await client.messages.create({
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        temperature: TEMPERATURE,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: userPrompt }],
-      });
-
-      const textBlock = message.content.find((b) => b.type === "text");
-      if (!textBlock || textBlock.type !== "text") return [];
-
-      let jsonText = textBlock.text.trim();
-      if (jsonText.startsWith("```")) {
-        jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-      }
-
-      const parsed = JSON.parse(jsonText);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch (retryErr) {
-      const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-      throw new Error(`Claude API failed after retry: ${retryMsg}`);
-    }
+    // Retry once — let it throw if it fails again
+    return await createMessage();
   }
 }
 
