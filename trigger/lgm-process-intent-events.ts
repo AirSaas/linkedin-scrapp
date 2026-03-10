@@ -1297,13 +1297,22 @@ async function sendGroupedSlackMessage(
     }
   }
 
-  // Section Pages
+  // Section Pages — group by contact to merge multiple page follows
   if (pagesEvents.length > 0) {
     message += `\n📄 *Pages* → LGM\n`;
-    for (const event of pagesEvents) {
-      const record = event.record;
-      const pageName = event.pageName;
 
+    const groupedPages = new Map<string, { record: IntentEvent; pageNames: string[] }>();
+    for (const event of pagesEvents) {
+      const key = event.record.CONTACT_LINKEDIN_PROFILE_URL ?? event.record.CONTACT_HUBSPOT_ID ?? `${event.record.CONTACT_FIRST_NAME}_${event.record.CONTACT_LAST_NAME}`;
+      const existing = groupedPages.get(key);
+      if (existing) {
+        existing.pageNames.push(event.pageName);
+      } else {
+        groupedPages.set(key, { record: event.record, pageNames: [event.pageName] });
+      }
+    }
+
+    for (const { record, pageNames } of groupedPages.values()) {
       const firstName = record.CONTACT_FIRST_NAME ?? "";
       const lastName = record.CONTACT_LAST_NAME ?? "";
       const fullName = `${firstName} ${lastName}`.trim() || "—";
@@ -1323,7 +1332,7 @@ async function sendGroupedSlackMessage(
 
       let line = `• ${fullName}`;
       if (jobLine) line += ` - ${jobLine}`;
-      line += ` (Follow Page ${pageName})`;
+      line += ` (Follow Page ${pageNames.join(", ")})`;
 
       const linkedinUrl = record.CONTACT_LINKEDIN_PROFILE_URL;
       const hubspotId = record.CONTACT_HUBSPOT_ID;
