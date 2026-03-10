@@ -254,6 +254,117 @@ export async function updateBatchCursor(
 }
 
 // ============================================
+// FAQ extraction cursor + data
+// ============================================
+
+export interface FaqCursor {
+  lastProcessedOffset: number;
+  totalConversations: number | null;
+  isDone: boolean;
+}
+
+export async function getFaqCursor(): Promise<FaqCursor> {
+  const { data } = await getCrispSupabase()
+    .from("tchat_faq_cursor")
+    .select("last_processed_offset, total_conversations, is_done")
+    .eq("id", "default")
+    .single();
+
+  if (!data) {
+    return { lastProcessedOffset: 0, totalConversations: null, isDone: false };
+  }
+  return {
+    lastProcessedOffset: data.last_processed_offset,
+    totalConversations: data.total_conversations,
+    isDone: data.is_done,
+  };
+}
+
+export async function updateFaqCursor(
+  offset: number,
+  isDone: boolean,
+  totalConversations?: number
+): Promise<void> {
+  const update: Record<string, unknown> = {
+    id: "default",
+    last_processed_offset: offset,
+    is_done: isDone,
+    last_run_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  if (totalConversations !== undefined) {
+    update.total_conversations = totalConversations;
+  }
+  await getCrispSupabase()
+    .from("tchat_faq_cursor")
+    .upsert(update, { onConflict: "id" });
+}
+
+export async function getConversationsForFaq(
+  offset: number,
+  limit: number
+): Promise<Array<{ session_id: string; contact_name: string | null; first_message_at: string; last_message_at: string; message_count_inbound: number; message_count_outbound: number }>> {
+  const since = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data, error } = await getCrispSupabase()
+    .from("tchat_conversations")
+    .select("session_id, contact_name, first_message_at, last_message_at, message_count_inbound, message_count_outbound")
+    .gte("first_message_at", since)
+    .order("first_message_at", { ascending: true })
+    .range(offset, offset + limit - 1);
+
+  if (error) {
+    throw new Error(`getConversationsForFaq: ${error.message}`);
+  }
+
+  // Filter conversations with at least 3 messages
+  return (data || []).filter(
+    (c) => (c.message_count_inbound || 0) + (c.message_count_outbound || 0) >= 3
+  );
+}
+
+export async function getMessagesForConversation(
+  sessionId: string
+): Promise<Array<{ direction: string; content: string; content_type: string; sender_name: string | null; crisp_timestamp: string }>> {
+  const { data, error } = await getCrispSupabase()
+    .from("tchat_messages")
+    .select("direction, content, content_type, sender_name, crisp_timestamp")
+    .eq("session_id", sessionId)
+    .order("crisp_timestamp", { ascending: true });
+
+  if (error) {
+    throw new Error(`getMessagesForConversation: ${error.message}`);
+  }
+  return data || [];
+}
+
+export async function upsertFaqExtraction(
+  sessionId: string,
+  contactName: string | null,
+  conversationDate: string,
+  extractions: unknown[],
+  modelUsed: string
+): Promise<void> {
+  const { error } = await getCrispSupabase()
+    .from("tchat_faq_extractions")
+    .upsert(
+      {
+        session_id: sessionId,
+        contact_name: contactName,
+        conversation_date: conversationDate,
+        extractions,
+        model_used: modelUsed,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "session_id" }
+    );
+
+  if (error) {
+    throw new Error(`upsertFaqExtraction: ${error.message}`);
+  }
+}
+
+// ============================================
 // Stats
 // ============================================
 
