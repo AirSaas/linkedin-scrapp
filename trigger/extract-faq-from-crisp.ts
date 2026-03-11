@@ -69,7 +69,7 @@ Réponds UNIQUEMENT en JSON valide, un tableau d'objets. Pas de markdown, pas de
 
 export const extractFaqSingleConversation = task({
   id: "extract-faq-single-conversation",
-  maxDuration: 300, // 5 min max per conversation
+  maxDuration: 600, // 10 min max per conversation
   run: async (payload: { sessionId: string; contactName: string | null; firstMessageAt: string; lastMessageAt: string }) => {
     const label = `${payload.contactName || "unknown"} (${payload.sessionId.slice(0, 12)}...)`;
     logger.info(`Processing conversation: ${label}`);
@@ -77,11 +77,17 @@ export const extractFaqSingleConversation = task({
     // 1. Fetch messages (only < 1 year old)
     const messages = await getMessagesForConversation(payload.sessionId);
     const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
-    const recentMessages = messages.filter((m) => m.crisp_timestamp >= oneYearAgo);
+    let recentMessages = messages.filter((m) => m.crisp_timestamp >= oneYearAgo);
 
     if (recentMessages.length < 3) {
       logger.info(`Skipping ${label}: only ${recentMessages.length} recent messages`);
       return { skipped: true, reason: "too_few_messages", messageCount: recentMessages.length };
+    }
+
+    // Cap to last 100 messages to avoid Claude Opus timeout on very long conversations
+    if (recentMessages.length > 100) {
+      logger.info(`Truncating ${label}: ${recentMessages.length} → 100 messages (keeping most recent)`);
+      recentMessages = recentMessages.slice(-100);
     }
 
     // 2. Build transcript
