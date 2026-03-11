@@ -69,7 +69,7 @@ Réponds UNIQUEMENT en JSON valide, un tableau d'objets. Pas de markdown, pas de
 
 export const extractFaqSingleConversation = task({
   id: "extract-faq-single-conversation",
-  maxDuration: 300, // 5 min max per conversation
+  maxDuration: 600, // 10 min max per conversation
   run: async (payload: { sessionId: string; contactName: string | null; firstMessageAt: string; lastMessageAt: string }) => {
     const label = `${payload.contactName || "unknown"} (${payload.sessionId.slice(0, 12)}...)`;
     logger.info(`Processing conversation: ${label}`);
