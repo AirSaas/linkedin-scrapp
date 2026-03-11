@@ -21,6 +21,8 @@ const EXCLUDED_GMAIL_CATEGORIES = new Set([
 /** Sender domains to exclude before AI classification */
 const EXCLUDED_SENDER_DOMAINS = new Set([
   "airsaas.io",       // internal team
+  "assurup.com",      // partner domain
+  "crisp.airsaas.io", // support chatbot
   "whimsical.com",    // collaboration tool notifications
   "qonto.com",        // banking notifications
   "notion.so",        // collaboration tool notifications
@@ -40,18 +42,7 @@ const RATE_LIMIT = {
 const AI_BATCH_SIZE = 10;
 const MAX_MESSAGES_FOR_AI = 10;
 
-/**
- * People with email (Gmail) connected to Unipile.
- * Add more entries here when other team members connect their Gmail.
- */
-const EMAIL_RECAP_ACCOUNTS = [
-  {
-    name: "Bertran Ruiz",
-    ghost_genius_id: "77afde07-9ff8-4a78-a067-e8357a99a843",
-    unipile_email_account_id: "wQaPpLN6S9uMUkyidP9RyQ",
-    email: "bertran@airsaas.io",
-  },
-];
+// Email accounts are now read from workspace_team.unipile_email_account_id
 
 // ============================================
 // TYPES
@@ -60,6 +51,8 @@ const EMAIL_RECAP_ACCOUNTS = [
 interface TeamMember {
   linkedin_urn: string;
   unipile_account_id: string;
+  unipile_email_account_id: string | null;
+  slack_id: string | null;
   firstname: string;
   lastname: string;
   ghost_genius_account_id: string;
@@ -135,17 +128,26 @@ export const weeklyUnansweredRecapTask = schedules.task({
         await sleep(RATE_LIMIT.HUBSPOT); // small pause between members
       }
 
-      // Step 4 — Email unanswered (EMAIL_RECAP_ACCOUNTS only)
+      // Step 4 — Email unanswered (team members with unipile_email_account_id)
       const emailItems: UnansweredItem[] = [];
-      for (const account of EMAIL_RECAP_ACCOUNTS) {
+      const emailMembers = team.filter((m) => m.unipile_email_account_id);
+      for (const member of emailMembers) {
         try {
-          const items = await getEmailUnanswered(account, mondayISO, fridayISO);
+          const items = await getEmailUnanswered(
+            {
+              name: `${member.firstname} ${member.lastname}`,
+              ghost_genius_id: member.ghost_genius_account_id,
+              unipile_email_account_id: member.unipile_email_account_id!,
+            },
+            mondayISO,
+            fridayISO
+          );
           emailItems.push(...items);
-          logger.info(`${account.name}: ${items.length} email unanswered`);
+          logger.info(`${member.firstname} ${member.lastname}: ${items.length} email unanswered`);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          logger.error(`Email error for ${account.name}: ${msg}`);
-          errors.push({ type: "Email", code: "exception", message: `${account.name}: ${msg}` });
+          logger.error(`Email error for ${member.firstname}: ${msg}`);
+          errors.push({ type: "Email", code: "exception", message: `${member.firstname}: ${msg}` });
         }
       }
 
@@ -153,7 +155,7 @@ export const weeklyUnansweredRecapTask = schedules.task({
       logger.info(`Total unanswered before AI: ${allItems.length} (${linkedinItems.length} LinkedIn, ${emailItems.length} email)`);
 
       if (allItems.length === 0) {
-        await sendSlackRecap(weekLabel, [], 0);
+        await sendSlackRecap(weekLabel, [], 0, team);
         logger.info("No unanswered messages, sent empty recap");
         return { success: true, total: 0, important: 0, filtered: 0 };
       }
@@ -177,8 +179,8 @@ export const weeklyUnansweredRecapTask = schedules.task({
         }
       }
 
-      // Step 7 — Post Slack recap
-      await sendSlackRecap(weekLabel, important, filtered.length);
+      // Step 7 — Post Slack recap (one message per commercial)
+      await sendSlackRecap(weekLabel, important, filtered.length, team);
 
       // Error reporting
       if (errors.length > 0) {
@@ -265,7 +267,7 @@ function getWeekBounds() {
 async function fetchTeamMembers(): Promise<TeamMember[]> {
   const { data, error } = await supabase
     .from("workspace_team")
-    .select("linkedin_urn, unipile_account_id, firstname, lastname, ghost_genius_account_id")
+    .select("linkedin_urn, unipile_account_id, unipile_email_account_id, slack_id, firstname, lastname, ghost_genius_account_id")
     .not("unipile_account_id", "is", null)
     .not("linkedin_urn", "is", null)
     .neq("linkedin_urn", "");
@@ -375,7 +377,7 @@ function isExcludedDomain(email: string): boolean {
 }
 
 async function getEmailUnanswered(
-  account: typeof EMAIL_RECAP_ACCOUNTS[0],
+  account: { name: string; ghost_genius_id: string; unipile_email_account_id: string },
   mondayISO: string,
   fridayISO: string
 ): Promise<UnansweredItem[]> {
@@ -637,7 +639,8 @@ async function lookupLinkedInByEmail(email: string): Promise<string | null> {
 async function sendSlackRecap(
   weekLabel: string,
   important: ClassifiedItem[],
-  filteredCount: number
+  filteredCount: number,
+  team: TeamMember[]
 ): Promise<void> {
   const webhookUrl = process.env.webhook_unanswered_recap;
   if (!webhookUrl) {
@@ -645,63 +648,82 @@ async function sendSlackRecap(
     return;
   }
 
-  let text = `📬 *Recap messages non répondus — ${weekLabel}*\n`;
-
-  if (important.length === 0) {
-    text += `\n✅ Aucun message important non répondu cette semaine !\n`;
-    text += `\n📊 ${filteredCount} messages filtrés (spam/notif)`;
-  } else {
-    // Group by team member
-    const byMember = new Map<string, ClassifiedItem[]>();
-    for (const item of important) {
-      const list = byMember.get(item.teamMemberName) ?? [];
-      list.push(item);
-      byMember.set(item.teamMemberName, list);
+  // Build slack_id lookup from team
+  const slackIdByKey = new Map<string, string>();
+  for (const m of team) {
+    if (m.slack_id && m.ghost_genius_account_id) {
+      slackIdByKey.set(m.ghost_genius_account_id, m.slack_id);
     }
-
-    for (const [memberName, items] of byMember) {
-      text += `\n━━━━━━━━━━━━━━━━━━━━━━━━━\n👤 *${memberName}*\n`;
-
-      const linkedinItems = items.filter((i) => i.source === "linkedin");
-      const emailItems = items.filter((i) => i.source === "email");
-
-      if (linkedinItems.length > 0) {
-        text += `\n💬 *LinkedIn (${linkedinItems.length})*\n`;
-        for (const item of linkedinItems) {
-          text += `• *${item.senderName}* — ${item.summary}`;
-          if (item.senderLinkedInUrl) {
-            text += `\n  <${item.senderLinkedInUrl}|Profil LinkedIn>`;
-          }
-          text += "\n";
-        }
-      }
-
-      if (emailItems.length > 0) {
-        text += `\n📧 *Email (${emailItems.length})*\n`;
-        for (const item of emailItems) {
-          const emailDisplay = item.senderEmail ? ` (${item.senderEmail})` : "";
-          text += `• *${item.senderName}*${emailDisplay} — ${item.summary}`;
-          if (item.senderLinkedInUrl) {
-            text += `\n  <${item.senderLinkedInUrl}|Profil LinkedIn>`;
-          }
-          text += "\n";
-        }
-      }
-    }
-
-    text += `\n━━━━━━━━━━━━━━━━━━━━━━━━━`;
-    text += `\n📊 ${important.length} messages importants / ${filteredCount} filtrés (spam/notif) — Classifié par Claude Sonnet`;
   }
 
+  if (important.length === 0) {
+    const text = `📬 *Recap messages non répondus — ${weekLabel}*\n\n✅ Aucun message important non répondu cette semaine !\n\n📊 ${filteredCount} messages filtrés (spam/notif)`;
+    await postToWebhook(webhookUrl, text);
+    return;
+  }
+
+  // Group by team member
+  const byMember = new Map<string, { key: string; items: ClassifiedItem[] }>();
+  for (const item of important) {
+    const existing = byMember.get(item.teamMemberName);
+    if (existing) {
+      existing.items.push(item);
+    } else {
+      byMember.set(item.teamMemberName, { key: item.teamMemberKey, items: [item] });
+    }
+  }
+
+  // One Slack message per commercial
+  for (const [memberName, { key, items }] of byMember) {
+    const slackId = slackIdByKey.get(key);
+    const mention = slackId ? `<@${slackId}>` : `*${memberName}*`;
+
+    let text = `📬 *Recap non répondus — ${weekLabel}*\n👤 ${mention}\n`;
+
+    const linkedinItems = items.filter((i) => i.source === "linkedin");
+    const emailItems = items.filter((i) => i.source === "email");
+
+    if (linkedinItems.length > 0) {
+      text += `\n💬 *LinkedIn (${linkedinItems.length})*\n`;
+      for (const item of linkedinItems) {
+        text += `• *${item.senderName}* — ${item.summary}`;
+        if (item.senderLinkedInUrl) {
+          text += `\n  <${item.senderLinkedInUrl}|Profil LinkedIn>`;
+        }
+        text += "\n";
+      }
+    }
+
+    if (emailItems.length > 0) {
+      text += `\n📧 *Email (${emailItems.length})*\n`;
+      for (const item of emailItems) {
+        const emailDisplay = item.senderEmail ? ` (${item.senderEmail})` : "";
+        text += `• *${item.senderName}*${emailDisplay} — ${item.summary}`;
+        if (item.senderLinkedInUrl) {
+          text += `\n  <${item.senderLinkedInUrl}|Profil LinkedIn>`;
+        }
+        text += "\n";
+      }
+    }
+
+    text += `\n📊 ${items.length} messages importants — Classifié par Claude Sonnet`;
+    await postToWebhook(webhookUrl, text);
+    await sleep(500); // small pause between Slack posts
+  }
+
+  logger.info(`Slack: ${byMember.size} messages sent (${important.length} items, ${filteredCount} filtered)`);
+}
+
+async function postToWebhook(url: string, text: string): Promise<void> {
   try {
-    const res = await fetch(webhookUrl, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
 
     if (res.ok) {
-      logger.info("Slack recap sent successfully");
+      logger.info("Slack message sent");
     } else {
       const body = await res.text();
       logger.error(`Slack webhook failed: ${res.status} — ${body}`);
