@@ -84,10 +84,10 @@ export const extractFaqSingleConversation = task({
       return { skipped: true, reason: "too_few_messages", messageCount: recentMessages.length };
     }
 
-    // Cap to last 200 messages to avoid Claude Opus timeout on very long conversations
-    if (recentMessages.length > 200) {
-      logger.info(`Truncating ${label}: ${recentMessages.length} → 200 messages (keeping most recent)`);
-      recentMessages = recentMessages.slice(-200);
+    // Cap to last 100 messages to avoid Claude Opus timeout on very long conversations
+    if (recentMessages.length > 100) {
+      logger.info(`Truncating ${label}: ${recentMessages.length} → 100 messages (keeping most recent)`);
+      recentMessages = recentMessages.slice(-100);
     }
 
     // 2. Build transcript
