@@ -1164,49 +1164,78 @@ function getSlackIdForOwner(
   return member?.slack_id ?? null;
 }
 
-function formatIntentEventLine(record: IntentEvent): string {
-  const firstName = record.CONTACT_FIRST_NAME ?? "";
-  const lastName = record.CONTACT_LAST_NAME ?? "";
-  const fullName = `${firstName} ${lastName}`.trim() || "—";
+function formatGroupedEventLines(records: IntentEvent[]): string {
+  // Group by contact to merge multiple event types on one line
+  const grouped = new Map<
+    string,
+    { record: IntentEvent; eventTypes: string[]; connected: boolean }
+  >();
 
-  const job = record.CONTACT_JOB || null;
-  const company = record.COMPANY_NAME || null;
-  let jobLine: string;
-  if (job && company) {
-    jobLine = `${job} @ ${company}`;
-  } else if (job) {
-    jobLine = job;
-  } else if (company) {
-    jobLine = `@ ${company}`;
-  } else {
-    jobLine = "";
+  for (const record of records) {
+    const key =
+      record.CONTACT_LINKEDIN_PROFILE_URL ??
+      record.CONTACT_HUBSPOT_ID ??
+      `${record.CONTACT_FIRST_NAME}_${record.CONTACT_LAST_NAME}`;
+    const existing = grouped.get(key);
+    const eventType = record.INTENT_EVENT_TYPE ?? "";
+    if (existing) {
+      if (eventType && !existing.eventTypes.includes(eventType)) {
+        existing.eventTypes.push(eventType);
+      }
+      if (record.CONNECTED_WITH_INTENT_OWNER === true) {
+        existing.connected = true;
+      }
+    } else {
+      grouped.set(key, {
+        record,
+        eventTypes: eventType ? [eventType] : [],
+        connected: record.CONNECTED_WITH_INTENT_OWNER === true,
+      });
+    }
   }
 
-  const eventType = record.INTENT_EVENT_TYPE ?? "";
-  const connected = record.CONNECTED_WITH_INTENT_OWNER === true;
-  const connectionStatus = connected
-    ? "connected"
-    : "not connected";
+  let result = "";
+  for (const { record, eventTypes, connected } of grouped.values()) {
+    const firstName = record.CONTACT_FIRST_NAME ?? "";
+    const lastName = record.CONTACT_LAST_NAME ?? "";
+    const fullName = `${firstName} ${lastName}`.trim() || "—";
 
-  let line = `• ${fullName}`;
-  if (jobLine) line += ` - ${jobLine}`;
-  line += ` (${eventType}, ${connectionStatus})`;
+    const job = record.CONTACT_JOB || null;
+    const company = record.COMPANY_NAME || null;
+    let jobLine: string;
+    if (job && company) {
+      jobLine = `${job} @ ${company}`;
+    } else if (job) {
+      jobLine = job;
+    } else if (company) {
+      jobLine = `@ ${company}`;
+    } else {
+      jobLine = "";
+    }
 
-  // Links line
-  const linkedinUrl = record.CONTACT_LINKEDIN_PROFILE_URL;
-  const hubspotId = record.CONTACT_HUBSPOT_ID;
+    const connectionStatus = connected ? "connected" : "not connected";
 
-  let linksLine = "  🔗 ";
-  if (linkedinUrl) {
-    linksLine += `<${linkedinUrl}|LinkedIn>`;
+    let line = `• ${fullName}`;
+    if (jobLine) line += ` - ${jobLine}`;
+    line += ` (${eventTypes.join(" + ")}, ${connectionStatus})`;
+
+    const linkedinUrl = record.CONTACT_LINKEDIN_PROFILE_URL;
+    const hubspotId = record.CONTACT_HUBSPOT_ID;
+
+    let linksLine = "  🔗 ";
+    if (linkedinUrl) {
+      linksLine += `<${linkedinUrl}|LinkedIn>`;
+    }
+    if (hubspotId) {
+      const hubspotUrl = `${HUBSPOT_CONTACT_BASE_URL}/${hubspotId}`;
+      if (linkedinUrl) linksLine += " | ";
+      linksLine += `<${hubspotUrl}|HubSpot>`;
+    }
+
+    result += `${line}\n${linksLine}\n`;
   }
-  if (hubspotId) {
-    const hubspotUrl = `${HUBSPOT_CONTACT_BASE_URL}/${hubspotId}`;
-    if (linkedinUrl) linksLine += " | ";
-    linksLine += `<${hubspotUrl}|HubSpot>`;
-  }
 
-  return `${line}\n${linksLine}`;
+  return result;
 }
 
 async function sendGroupedSlackMessage(
@@ -1284,16 +1313,12 @@ async function sendGroupedSlackMessage(
 
     if (events.hubspot.length > 0) {
       message += `→ *HubSpot IA Agent SDR*\n`;
-      for (const record of events.hubspot) {
-        message += formatIntentEventLine(record) + "\n";
-      }
+      message += formatGroupedEventLines(events.hubspot);
     }
 
     if (events.lgm.length > 0) {
       message += `→ *LGM*\n`;
-      for (const record of events.lgm) {
-        message += formatIntentEventLine(record) + "\n";
-      }
+      message += formatGroupedEventLines(events.lgm);
     }
   }
 
