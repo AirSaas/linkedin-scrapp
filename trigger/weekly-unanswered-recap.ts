@@ -699,8 +699,16 @@ async function sendSlackRecap(
       for (const item of emailItems) {
         const emailDisplay = item.senderEmail ? ` (${item.senderEmail})` : "";
         text += `• *${item.senderName}*${emailDisplay} — ${item.summary}`;
+        const links: string[] = [];
+        if (item.senderEmail && item.subject) {
+          const gmailQuery = encodeURIComponent(`from:${item.senderEmail} subject:${item.subject}`);
+          links.push(`<https://mail.google.com/mail/u/0/#search/${gmailQuery}|Gmail>`);
+        }
         if (item.senderLinkedInUrl) {
-          text += `\n  <${item.senderLinkedInUrl}|Profil LinkedIn>`;
+          links.push(`<${item.senderLinkedInUrl}|LinkedIn>`);
+        }
+        if (links.length > 0) {
+          text += `\n  🔗 ${links.join(" | ")}`;
         }
         text += "\n";
       }
