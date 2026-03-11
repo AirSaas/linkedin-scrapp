@@ -77,11 +77,17 @@ export const extractFaqSingleConversation = task({
     // 1. Fetch messages (only < 1 year old)
     const messages = await getMessagesForConversation(payload.sessionId);
     const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
-    const recentMessages = messages.filter((m) => m.crisp_timestamp >= oneYearAgo);
+    let recentMessages = messages.filter((m) => m.crisp_timestamp >= oneYearAgo);
 
     if (recentMessages.length < 3) {
       logger.info(`Skipping ${label}: only ${recentMessages.length} recent messages`);
       return { skipped: true, reason: "too_few_messages", messageCount: recentMessages.length };
+    }
+
+    // Cap to last 200 messages to avoid Claude Opus timeout on very long conversations
+    if (recentMessages.length > 200) {
+      logger.info(`Truncating ${label}: ${recentMessages.length} → 200 messages (keeping most recent)`);
+      recentMessages = recentMessages.slice(-200);
     }
 
     // 2. Build transcript
