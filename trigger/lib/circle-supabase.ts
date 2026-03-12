@@ -87,3 +87,90 @@ export async function upsertPosts(
 
   return { upserted, errors };
 }
+
+// ============================================
+// Circle context for FAQ cross-reference
+// ============================================
+
+const TEAM_NAMES = ["simon", "thomas", "matthieu", "bertran"];
+
+interface CirclePostRow {
+  id: number;
+  name: string;
+  url: string;
+  space_slug: string;
+  body_plain_text: string | null;
+  comments: unknown[] | null;
+  published_at: string;
+}
+
+/**
+ * Build a compact text block of all Circle posts for injection into the FAQ prompt.
+ * Includes post title, URL, space, excerpt, and team member comments.
+ */
+export async function getCircleContext(): Promise<string> {
+  const { data, error } = await getSupabase()
+    .from("circle_posts")
+    .select("id, name, url, space_slug, body_plain_text, comments, published_at")
+    .order("published_at", { ascending: false });
+
+  if (error || !data?.length) {
+    logger.warn("getCircleContext: no data", { error });
+    return "";
+  }
+
+  const lines: string[] = [
+    "ARTICLES COMMUNAUTÉ CIRCLE (base de connaissances produit) :",
+    "",
+  ];
+
+  for (const post of data as CirclePostRow[]) {
+    const excerpt = (post.body_plain_text || "").slice(0, 200).replace(/\n/g, " ");
+    const date = post.published_at?.slice(0, 10) || "";
+    lines.push(`- [${post.space_slug}] "${post.name}" (${date})`);
+    lines.push(`  URL: ${post.url}`);
+    if (excerpt) lines.push(`  Résumé: ${excerpt}`);
+
+    // Extract team member comments (solutions, clarifications)
+    if (Array.isArray(post.comments) && post.comments.length > 0) {
+      const teamComments = extractTeamComments(post.comments);
+      if (teamComments.length > 0) {
+        lines.push(`  Réponses équipe: ${teamComments.join(" | ")}`);
+      }
+    }
+
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+function extractTeamComments(comments: unknown[]): string[] {
+  const results: string[] = [];
+
+  for (const c of comments as Record<string, unknown>[]) {
+    const user = c.user as Record<string, string> | undefined;
+    const body = c.body as Record<string, string> | undefined;
+    if (!user?.name || !body?.body) continue;
+
+    const nameLower = user.name.toLowerCase();
+    if (TEAM_NAMES.some((t) => nameLower.includes(t))) {
+      const text = body.body
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .slice(0, 150)
+        .replace(/\n/g, " ")
+        .trim();
+      if (text) {
+        results.push(`${user.name}: "${text}"`);
+      }
+    }
+
+    // Check nested replies
+    if (Array.isArray(c.replies) && (c.replies as unknown[]).length > 0) {
+      results.push(...extractTeamComments(c.replies as unknown[]));
+    }
+  }
+
+  return results.slice(0, 5); // Cap per post to keep context manageable
+}

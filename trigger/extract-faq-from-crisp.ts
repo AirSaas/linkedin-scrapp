@@ -8,6 +8,7 @@ import {
   getMessagesForConversation,
   upsertFaqExtraction,
 } from "./lib/crisp-supabase.js";
+import { getCircleContext } from "./lib/circle-supabase.js";
 
 // ============================================
 // CONFIGURATION
@@ -40,7 +41,6 @@ Pour chaque sujet identifié, analyse en profondeur :
 4. LE SIGNAL — qu'est-ce que cette conversation révèle sur le produit :
    - documentation_missing : la doc n'existe pas ou est insuffisante
    - feature_misunderstood : la feature existe mais le client ne la comprend pas
-   - bug_report : c'est un bug confirmé
    - ux_confusion : l'interface prête à confusion, le client ne trouve pas la feature
    - feature_request : le client demande une feature qui n'existe pas
    - onboarding_gap : le client n'a pas été formé sur ce point clé
@@ -55,11 +55,26 @@ Pour chaque sujet identifié, analyse en profondeur :
 
 6. RÉPONSE FAQ SUGGÉRÉE — à partir des réponses RÉELLES données par le support dans la conversation, rédige une réponse FAQ claire, structurée et actionnable. Inclus les étapes concrètes, les liens mentionnés, et les cas de figure identifiés lors du diagnostic. La réponse doit être autonome (compréhensible sans lire la conversation).
 
+7. CITATIONS SOURCE — extrais 2-3 phrases VERBATIM de la conversation (ce que le client a écrit) qui prouvent que cette question a été posée. Cela sert de preuve d'authenticité.
+
+8. RÉFÉRENCES CIRCLE — on te fournit une liste d'articles de la communauté Circle (guides, nouveautés, tutoriels). Utilise-les pour :
+   a) Vérifier si une "limitation" mentionnée dans la conversation a DEPUIS été résolue (un post dans "ca-vient-de-sortir" annonce la feature) → dans ce cas, ne mentionne PAS la limitation dans ta réponse FAQ, mais donne la solution actuelle avec le lien Circle
+   b) Ajouter un lien Circle pertinent dans la réponse FAQ quand un article couvre le sujet
+   c) Pour les questions de droits, permissions, rôles, vues : cherche TOUJOURS un article Circle lié
+
 RÈGLES :
+- ANONYMISATION : ne JAMAIS citer de nom de client, d'entreprise cliente, ou d'information identifiable dans la FAQ. Remplace par des termes génériques ("votre organisation", "un utilisateur"). Exemple interdit : "comme chez Alcyon" → écris "si votre année fiscale commence au 1er octobre"
+- EXCLUSION DES BUGS : si la conversation porte sur un bug spécifique, un dysfonctionnement technique ponctuel, ou un problème déjà résolu par un correctif, NE PAS générer d'entrée FAQ. Un bug n'est pas une FAQ. Retourne [] si la conversation est purement un signalement de bug. Exception : si le "bug" révèle un malentendu fonctionnel fréquent (le client pense que c'est un bug alors que c'est un comportement voulu), c'est un signal "feature_misunderstood" valide.
+- DÉDUPLICATION : si deux sujets dans la même conversation sont des variantes du même problème (ex: "filtres ET/OU" et "filtres complexes Smart Views"), fusionne-les en UNE seule entrée FAQ qui couvre tous les angles. Ne génère jamais deux entrées quasi-identiques.
 - Les messages marqués [NOTE INTERNE] sont des notes privées du support — utilise-les pour le contexte mais ne les cite pas dans la FAQ
 - Les messages marqués [FICHIER: ...] indiquent qu'un fichier/screenshot a été partagé — mentionne-le dans file_references
 - Si la conversation ne contient aucun sujet FAQ pertinent (bavardage, spam, test), retourne []
 - Sois exigeant sur le score : une vraie FAQ doit aider d'AUTRES clients, pas juste ce client précis
+- FORMATAGE MARKDOWN dans suggested_faq_answer :
+  - Bullet points : "- " (tiret espace), sous-niveaux avec 2 espaces d'indentation
+  - Listes numérotées : "1. " avec indentation cohérente
+  - Ne jamais mixer bullet points et numéros dans la même liste
+  - Sous-titres en **Gras**
 
 Réponds UNIQUEMENT en JSON valide, un tableau d'objets. Pas de markdown, pas de backticks, pas de commentaires.`;
 
@@ -90,13 +105,14 @@ export const extractFaqSingleConversation = task({
       recentMessages = recentMessages.slice(-100);
     }
 
-    // 2. Build transcript
+    // 2. Build transcript + fetch Circle context
     const transcript = buildTranscript(recentMessages);
-    logger.info(`Transcript: ${recentMessages.length} messages, ${transcript.length} chars`);
+    const circleContext = await getCircleContext();
+    logger.info(`Transcript: ${recentMessages.length} messages, ${transcript.length} chars, Circle context: ${circleContext.length} chars`);
 
     // 3. Call Claude
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const extractions = await callClaude(client, payload, transcript);
+    const extractions = await callClaude(client, payload, transcript, circleContext);
 
     // 4. Save
     await upsertFaqExtraction(
@@ -254,7 +270,8 @@ function buildTranscript(messages: Message[]): string {
 async function callClaude(
   client: Anthropic,
   convo: { contactName: string | null; firstMessageAt: string; lastMessageAt: string },
-  transcript: string
+  transcript: string,
+  circleContext: string
 ): Promise<unknown[]> {
   const firstDate = new Date(convo.firstMessageAt).toLocaleDateString("fr-FR");
   const lastDate = new Date(convo.lastMessageAt).toLocaleDateString("fr-FR");
@@ -263,7 +280,9 @@ async function callClaude(
 
 ${transcript}
 
-Extrais les entrées FAQ en JSON :
+${circleContext}
+
+Extrais les entrées FAQ en JSON (rappel : exclure les bug reports, anonymiser les noms de clients, dédupliquer les sujets similaires, vérifier les limitations obsolètes via les articles Circle) :
 [{
   "explicit_question": "...",
   "underlying_need": "...",
@@ -272,13 +291,15 @@ Extrais les entrées FAQ en JSON :
   "diagnostic_questions": ["..."],
   "resolution": "...",
   "resolution_type": "simple_answer|doc_gap|bug_fix|feature_request|config_help|investigation",
-  "signal": "documentation_missing|feature_misunderstood|bug_report|ux_confusion|feature_request|onboarding_gap|ask_setting",
+  "signal": "documentation_missing|feature_misunderstood|ux_confusion|feature_request|onboarding_gap|ask_setting",
   "faq_score": 4,
   "faq_score_reason": "...",
   "complexity": "simple|investigation|bug|feature_request",
   "suggested_faq_title": "...",
   "suggested_faq_answer": "...",
-  "file_references": ["..."]
+  "file_references": ["..."],
+  "source_quotes": ["citation verbatim du client prouvant la question"],
+  "circle_references": [{"title": "Titre article Circle", "url": "https://club.airsaas.io/..."}]
 }]`;
 
   const createMessage = async () => {
