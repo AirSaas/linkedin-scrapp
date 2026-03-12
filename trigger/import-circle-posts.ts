@@ -195,6 +195,24 @@ function extractTipTapImages(
   }
 }
 
+/** Strip HTML tags and decode common entities → plain text */
+function htmlToPlainText(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function mapPostToRow(
   post: CirclePost,
   comments: CircleComment[] | null
@@ -218,7 +236,7 @@ function mapPostToRow(
     tiptap_body: post.tiptap_body ?? null,
     images: extractImages(post),
     attachments: post.tiptap_body?.attachments ?? null,
-    body_plain_text: post.body_plain_text ?? null,
+    body_plain_text: post.body?.body ? htmlToPlainText(post.body.body) : null,
     cover_image_url: post.cover_image_url,
     likes_count: post.likes_count ?? 0,
     comments_count: post.comments_count ?? 0,
