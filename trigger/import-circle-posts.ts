@@ -288,10 +288,11 @@ class CircleClient {
     perPage = 20
   ): Promise<PaginatedResponse<CircleComment>> {
     const params = new URLSearchParams({
+      post_id: String(postId),
       page: String(page),
       per_page: String(perPage),
     });
-    const url = `${this.baseUrl}/posts/${postId}/comments?${params}`;
+    const url = `${this.baseUrl}/comments?${params}`;
     const res = await fetch(url, { headers: this.headers });
     if (!res.ok)
       throw new Error(
@@ -321,17 +322,23 @@ class CircleClient {
 // Trigger.dev Task
 // ---------------------------------------------------------------------------
 
+const DEFAULT_SPACE_SLUGS = [
+  "ca-vient-de-sortir",
+  "utilisateurs-d-airsaas",
+  "debuter-sur-airsaas",
+];
+
 export const importCirclePosts = task({
   id: "import-circle-posts",
   maxDuration: 600,
 
   run: async (payload: {
-    spaceSlug?: string;
+    spaceSlugs?: string[];
     dryRun?: boolean;
     fullSync?: boolean;
   }) => {
     const {
-      spaceSlug = "ca-vient-de-sortir",
+      spaceSlugs = DEFAULT_SPACE_SLUGS,
       dryRun = false,
       fullSync = false,
     } = payload;
@@ -346,137 +353,166 @@ export const importCirclePosts = task({
     const circle = new CircleClient(circleToken, circleHost);
 
     logger.info("Import Circle → Supabase", {
-      spaceSlug,
+      spaceSlugs,
       dryRun,
       fullSync,
       circleHost,
     });
 
-    // --- 1. Get space ---
-    const space = await circle.getSpaceBySlug(spaceSlug);
-    if (!space) {
-      throw new Error(
-        `Space "${spaceSlug}" introuvable sur ${circleHost}. Vérifie le slug ou les permissions du token.`
-      );
-    }
-    logger.info(`Space trouvé : "${space.name}" (id=${space.id})`);
+    const allGroups: TaskResultGroup[] = [];
+    const spaceResults: Array<{
+      space: { id: number; name: string; slug: string };
+      upserted: number;
+      skipped: number;
+      comments: number;
+      errors: number;
+    }> = [];
 
-    // --- 2. Read cursor ---
-    const cursorDate = fullSync ? null : await getSyncCursor(spaceSlug);
-    if (cursorDate) {
-      logger.info(`Curseur : ${cursorDate} (incremental)`);
-    } else {
-      logger.info("Pas de curseur — full sync");
-    }
+    for (const spaceSlug of spaceSlugs) {
+      logger.info(`\n--- Space: ${spaceSlug} ---`);
 
-    // --- 3. Paginate posts + fetch comments ---
-    let totalUpserted = 0;
-    let totalSkipped = 0;
-    let totalCommentsFetched = 0;
-    const errors: string[] = [];
-    let latestUpdatedAt: string | null = null;
-
-    for (const status of ["published", "draft"] as const) {
-      let page = 1;
-      let hasNextPage = true;
-
-      while (hasNextPage) {
-        const data = await circle.getPosts(space.id, page, 20, status);
-        logger.info(
-          `Page ${page}/${data.page_count} (${status}) — ${data.records.length} posts`
-        );
-
-        if (data.records.length === 0) break;
-
-        const rowsToUpsert: Record<string, unknown>[] = [];
-
-        for (const post of data.records) {
-          // Track latest updated_at for cursor
-          if (
-            !latestUpdatedAt ||
-            new Date(post.updated_at) > new Date(latestUpdatedAt)
-          ) {
-            latestUpdatedAt = post.updated_at;
-          }
-
-          // Skip if not updated since cursor
-          if (
-            cursorDate &&
-            new Date(post.updated_at) <= new Date(cursorDate)
-          ) {
-            totalSkipped++;
-            continue;
-          }
-
-          // Fetch comments if any
-          let comments: CircleComment[] | null = null;
-          if (post.comments_count > 0) {
-            try {
-              comments = await circle.getAllCommentsForPost(post.id);
-              totalCommentsFetched += comments.length;
-              logger.info(
-                `Post ${post.id}: ${comments.length} commentaires`
-              );
-            } catch (err) {
-              const msg = `Comments post ${post.id}: ${err instanceof Error ? err.message : String(err)}`;
-              logger.error(msg);
-              errors.push(msg);
-            }
-          }
-
-          rowsToUpsert.push(mapPostToRow(post, comments));
-        }
-
-        if (dryRun) {
-          logger.info(
-            `[DRY RUN] ${rowsToUpsert.length} posts seraient upsertés`,
-            { posts: rowsToUpsert.map((r) => ({ id: r.id, name: r.name })) }
-          );
-          totalUpserted += rowsToUpsert.length;
-        } else {
-          const result = await upsertPosts(rowsToUpsert);
-          totalUpserted += result.upserted;
-          errors.push(...result.errors);
-        }
-
-        hasNextPage = data.has_next_page;
-        page++;
-        if (hasNextPage) await new Promise((r) => setTimeout(r, 300));
+      // --- 1. Get space ---
+      const space = await circle.getSpaceBySlug(spaceSlug);
+      if (!space) {
+        logger.error(`Space "${spaceSlug}" introuvable sur ${circleHost}`);
+        allGroups.push({
+          label: `Circle ${spaceSlug}`,
+          inserted: 0,
+          skipped: 0,
+          errors: [
+            {
+              type: "Circle Import",
+              code: "NOT_FOUND",
+              message: `Space "${spaceSlug}" introuvable`,
+            },
+          ],
+        });
+        continue;
       }
-    }
+      logger.info(`Space trouvé : "${space.name}" (id=${space.id})`);
 
-    // --- 4. Update cursor ---
-    if (!dryRun && latestUpdatedAt) {
-      await updateSyncCursor(spaceSlug, latestUpdatedAt);
-      logger.info(`Curseur mis à jour : ${latestUpdatedAt}`);
+      // --- 2. Read cursor ---
+      const cursorDate = fullSync ? null : await getSyncCursor(spaceSlug);
+      if (cursorDate) {
+        logger.info(`Curseur : ${cursorDate} (incremental)`);
+      } else {
+        logger.info("Pas de curseur — full sync");
+      }
+
+      // --- 3. Paginate posts + fetch comments ---
+      let totalUpserted = 0;
+      let totalSkipped = 0;
+      let totalCommentsFetched = 0;
+      const errors: string[] = [];
+      let latestUpdatedAt: string | null = null;
+
+      for (const status of ["published", "draft"] as const) {
+        let page = 1;
+        let hasNextPage = true;
+
+        while (hasNextPage) {
+          const data = await circle.getPosts(space.id, page, 20, status);
+          logger.info(
+            `[${spaceSlug}] Page ${page}/${data.page_count} (${status}) — ${data.records.length} posts`
+          );
+
+          if (data.records.length === 0) break;
+
+          const rowsToUpsert: Record<string, unknown>[] = [];
+
+          for (const post of data.records) {
+            if (
+              !latestUpdatedAt ||
+              new Date(post.updated_at) > new Date(latestUpdatedAt)
+            ) {
+              latestUpdatedAt = post.updated_at;
+            }
+
+            if (
+              cursorDate &&
+              new Date(post.updated_at) <= new Date(cursorDate)
+            ) {
+              totalSkipped++;
+              continue;
+            }
+
+            let comments: CircleComment[] | null = null;
+            if (post.comments_count > 0) {
+              try {
+                comments = await circle.getAllCommentsForPost(post.id);
+                totalCommentsFetched += comments.length;
+                logger.info(
+                  `Post ${post.id}: ${comments.length} commentaires`
+                );
+              } catch (err) {
+                const msg = `Comments post ${post.id}: ${err instanceof Error ? err.message : String(err)}`;
+                logger.error(msg);
+                errors.push(msg);
+              }
+            }
+
+            rowsToUpsert.push(mapPostToRow(post, comments));
+          }
+
+          if (dryRun) {
+            logger.info(
+              `[DRY RUN] ${rowsToUpsert.length} posts seraient upsertés`,
+              { posts: rowsToUpsert.map((r) => ({ id: r.id, name: r.name })) }
+            );
+            totalUpserted += rowsToUpsert.length;
+          } else {
+            const result = await upsertPosts(rowsToUpsert);
+            totalUpserted += result.upserted;
+            errors.push(...result.errors);
+          }
+
+          hasNextPage = data.has_next_page;
+          page++;
+          if (hasNextPage) await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+
+      // --- 4. Update cursor ---
+      if (!dryRun && latestUpdatedAt) {
+        await updateSyncCursor(spaceSlug, latestUpdatedAt);
+        logger.info(`[${spaceSlug}] Curseur mis à jour : ${latestUpdatedAt}`);
+      }
+
+      if (errors.length > 0) {
+        allGroups.push({
+          label: `Circle ${spaceSlug}`,
+          inserted: totalUpserted,
+          skipped: totalSkipped,
+          errors: errors.map((msg) => ({
+            type: "Circle Import",
+            code: "ERROR",
+            message: msg,
+          })),
+        });
+      }
+
+      spaceResults.push({
+        space: { id: space.id, name: space.name, slug: space.slug },
+        upserted: totalUpserted,
+        skipped: totalSkipped,
+        comments: totalCommentsFetched,
+        errors: errors.length,
+      });
+
+      logger.info(
+        `[${spaceSlug}] Terminé: ${totalUpserted} upserted, ${totalSkipped} skipped, ${totalCommentsFetched} comments, ${errors.length} errors`
+      );
     }
 
     // --- 5. Error reporting ---
-    if (errors.length > 0) {
-      const group: TaskResultGroup = {
-        label: `Circle ${spaceSlug}`,
-        inserted: totalUpserted,
-        skipped: totalSkipped,
-        errors: errors.map((msg) => ({
-          type: "Circle Import",
-          code: "ERROR",
-          message: msg,
-        })),
-      };
-      await sendErrorToScriptLogs("Import Circle Posts", [group]);
+    if (allGroups.length > 0) {
+      await sendErrorToScriptLogs("Import Circle Posts", allGroups);
     }
 
     const summary = {
-      space: { id: space.id, name: space.name, slug: space.slug },
-      totalUpserted,
-      totalSkipped,
-      totalCommentsFetched,
-      totalErrors: errors.length,
-      errors: errors.length > 0 ? errors : undefined,
+      spaces: spaceResults,
       dryRun,
       fullSync,
-      cursorUsed: cursorDate,
-      newCursor: latestUpdatedAt,
       completedAt: new Date().toISOString(),
     };
 
