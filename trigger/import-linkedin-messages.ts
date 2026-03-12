@@ -2,18 +2,15 @@ import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { getSupabase } from "./lib/supabase.js";
 import { unipile } from "./lib/unipile.js";
 import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
+import { sendMessageToHubSpot } from "./lib/hubspot.js";
 
 // ============================================
 // CONFIGURATION
 // ============================================
-const HUBSPOT_API_BASE = "https://api.hubapi.com";
-
 const RATE_LIMIT = {
   BETWEEN_MESSAGES: 200,
   BETWEEN_THREADS: 500,
   BETWEEN_ACCOUNTS: 2000,
-  BETWEEN_HUBSPOT_CALLS: 150,
-  HUBSPOT_429_PAUSE: 10000,
 };
 
 // ============================================
@@ -194,7 +191,7 @@ export const importLinkedinMessagesTask = schedules.task({
                 // HubSpot + Zapier for 1:1 threads
                 if (participantsCount === 2 && mainParticipantId) {
                   try {
-                    const hsCommId = await sendToHubSpot(
+                    const hsCommId = await sendMessageToHubSpot(
                       messageRecord,
                       hubspotOwners
                     );
@@ -245,6 +242,50 @@ export const importLinkedinMessagesTask = schedules.task({
       }
     }
 
+    // 4. Retry HubSpot for recent messages without hubspot_communication_id
+    let hubspotRetried = 0;
+    const RETRY_LOOKBACK_DAYS = 7;
+    const RETRY_MAX = 50;
+    const retryAfter = new Date(
+      Date.now() - RETRY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+    ).toISOString();
+
+    try {
+      const { data: pendingMessages, error: pendingError } = await getSupabase()
+        .from("scrapped_linkedin_messages")
+        .select("id, thread_id, message_date, text, sender_id, participant_owner_id, participants_numbers, main_participant_id")
+        .is("hubspot_communication_id", null)
+        .eq("participants_numbers", 2)
+        .not("main_participant_id", "is", null)
+        .gte("message_date", retryAfter)
+        .order("message_date", { ascending: false })
+        .limit(RETRY_MAX);
+
+      if (pendingError) {
+        logger.error(`Failed to fetch pending messages: ${pendingError.message}`);
+      } else if (pendingMessages && pendingMessages.length > 0) {
+        logger.info(`Retrying HubSpot for ${pendingMessages.length} pending messages (last ${RETRY_LOOKBACK_DAYS}d)`);
+
+        for (const msg of pendingMessages) {
+          try {
+            const hsCommId = await sendMessageToHubSpot(msg as Record<string, unknown>, hubspotOwners);
+            if (hsCommId) {
+              await updateHubSpotCommId(msg.id, hsCommId);
+              hubspotRetried++;
+            }
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err);
+            logger.error(`HubSpot retry error for ${msg.id}: ${m}`);
+          }
+          await sleep(RATE_LIMIT.BETWEEN_MESSAGES);
+        }
+        logger.info(`HubSpot retry: ${hubspotRetried}/${pendingMessages.length} messages sent`);
+      }
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      logger.error(`HubSpot retry pass failed: ${m}`);
+    }
+
     // Send error recap to #script-logs
     await sendErrorToScriptLogs("Import LinkedIn Messages", [{
       label: "Messages",
@@ -261,6 +302,7 @@ export const importLinkedinMessagesTask = schedules.task({
       totalMessages,
       newMessages,
       hubspotSent,
+      hubspotRetried,
       zapierSent,
       errors: errorDetails.length,
     };
@@ -465,203 +507,6 @@ function reconstructParticipants(
   participants.push(ownerProfile);
 
   return participants;
-}
-
-// ============================================
-// HUBSPOT HELPERS
-// ============================================
-async function callHubSpot(
-  url: string,
-  method: string,
-  payload?: unknown
-): Promise<Record<string, unknown>> {
-  const token = process.env.HUBSPOT_ACCESS_TOKEN ?? "";
-
-  const options: RequestInit = {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-  };
-
-  if (payload && ["POST", "PUT", "PATCH"].includes(method)) {
-    options.body = JSON.stringify(payload);
-  }
-
-  const res = await fetch(url, options);
-
-  if (res.status === 429) {
-    logger.warn("HubSpot rate limit 429, pausing 10s...");
-    await sleep(RATE_LIMIT.HUBSPOT_429_PAUSE);
-    return callHubSpot(url, method, payload);
-  }
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HTTP ${res.status}: ${text.substring(0, 300)}`);
-  }
-
-  const text = await res.text();
-  return text.length > 0 ? JSON.parse(text) : {};
-}
-
-async function findHubSpotContact(
-  linkedinUrn: string
-): Promise<{ id: string } | null> {
-  const response = await callHubSpot(
-    `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/search`,
-    "POST",
-    {
-      filterGroups: [
-        {
-          filters: [
-            {
-              propertyName: "linkedinprofileurn",
-              operator: "EQ",
-              value: linkedinUrn,
-            },
-          ],
-        },
-      ],
-      limit: 1,
-    }
-  );
-
-  const results = (response.results ?? []) as { id: string }[];
-  return results.length > 0 ? results[0] : null;
-}
-
-async function getContactDeals(contactId: string): Promise<string[]> {
-  try {
-    const response = await callHubSpot(
-      `${HUBSPOT_API_BASE}/crm/v4/objects/contacts/${contactId}/associations/deals`,
-      "GET"
-    );
-
-    const results = (response.results ?? []) as {
-      toObjectId?: string;
-      id?: string;
-    }[];
-    return results.map((r) => r.toObjectId ?? r.id ?? "").filter(Boolean);
-  } catch (err) {
-    const m = err instanceof Error ? err.message : String(err);
-    logger.warn(`Failed to fetch deals for contact ${contactId}: ${m}`);
-    return [];
-  }
-}
-
-async function sendToHubSpot(
-  messageRecord: Record<string, unknown>,
-  hubspotOwners: Map<string, string>
-): Promise<string | null> {
-  const ownerUrn = messageRecord.participant_owner_id as string;
-  const hubspotOwnerId = hubspotOwners.get(ownerUrn);
-  if (!hubspotOwnerId) {
-    logger.debug(`No HubSpot owner for ${ownerUrn}`);
-    return null;
-  }
-
-  const mainParticipantId = messageRecord.main_participant_id as string;
-
-  let contact;
-  try {
-    contact = await findHubSpotContact(mainParticipantId);
-  } catch (err) {
-    const em = err instanceof Error ? err.message : String(err);
-    throw new Error(`Contact search failed: ${em}`);
-  }
-  await sleep(RATE_LIMIT.BETWEEN_HUBSPOT_CALLS);
-
-  if (!contact) {
-    logger.debug(`No HubSpot contact for ${mainParticipantId}`);
-    return null;
-  }
-
-  const direction =
-    messageRecord.sender_id === ownerUrn ? "Outbound" : "Inbound";
-  const communicationBody = `${direction}: ${messageRecord.text}`;
-
-  const contactDeals = await getContactDeals(contact.id);
-  await sleep(RATE_LIMIT.BETWEEN_HUBSPOT_CALLS);
-
-  // Validate deals exist before associating (stale/archived deals cause HTTP 400)
-  const validDeals: string[] = [];
-  for (const dealId of contactDeals) {
-    try {
-      await callHubSpot(
-        `${HUBSPOT_API_BASE}/crm/v3/objects/deals/${dealId}?properties=dealname`,
-        "GET"
-      );
-      validDeals.push(dealId);
-    } catch {
-      logger.warn(
-        `Deal ${dealId} not valid for contact ${contact.id}, skipping`
-      );
-    }
-    await sleep(RATE_LIMIT.BETWEEN_HUBSPOT_CALLS);
-  }
-
-  const contactAssociation = {
-    to: { id: contact.id },
-    types: [
-      { associationCategory: "HUBSPOT_DEFINED", associationTypeId: 81 },
-    ],
-  };
-
-  const associations: Record<string, unknown>[] = [contactAssociation];
-  for (const dealId of validDeals) {
-    associations.push({
-      to: { id: dealId },
-      types: [
-        { associationCategory: "HUBSPOT_DEFINED", associationTypeId: 87 },
-      ],
-    });
-  }
-
-  const commPayload = {
-    properties: {
-      hs_communication_channel_type: "LINKEDIN_MESSAGE",
-      hs_communication_logged_from: "CRM",
-      hs_communication_body: communicationBody,
-      hs_timestamp: messageRecord.message_date,
-      hubspot_owner_id: hubspotOwnerId,
-    },
-    associations,
-  };
-
-  let response;
-  try {
-    response = await callHubSpot(
-      `${HUBSPOT_API_BASE}/crm/v3/objects/communications`,
-      "POST",
-      commPayload
-    );
-  } catch (err) {
-    const em = err instanceof Error ? err.message : String(err);
-    // Fallback: retry without deal associations if they caused the failure
-    if (em.includes("associations are not valid") && validDeals.length > 0) {
-      logger.warn(
-        `Retrying without deal associations for message ${messageRecord.id}`
-      );
-      response = await callHubSpot(
-        `${HUBSPOT_API_BASE}/crm/v3/objects/communications`,
-        "POST",
-        { ...commPayload, associations: [contactAssociation] }
-      );
-    } else {
-      throw new Error(`Communication POST failed: ${em}`);
-    }
-  }
-
-  const hsId = response.id as string | undefined;
-  if (hsId) {
-    logger.info(
-      `HubSpot communication created: ${hsId} (${direction}) for message ${messageRecord.id}`
-    );
-  }
-  await sleep(RATE_LIMIT.BETWEEN_HUBSPOT_CALLS);
-  return hsId ?? null;
 }
 
 // ============================================
