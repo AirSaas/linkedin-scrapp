@@ -325,6 +325,15 @@ Extrais les entrées FAQ en JSON (rappel : exclure les bug reports, anonymiser l
       jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
     }
 
+    // If Claude wrapped JSON in prose text, extract the JSON array
+    if (!jsonText.startsWith("[")) {
+      const firstBracket = jsonText.indexOf("[");
+      const lastBracket = jsonText.lastIndexOf("]");
+      if (firstBracket !== -1 && lastBracket > firstBracket) {
+        jsonText = jsonText.slice(firstBracket, lastBracket + 1);
+      }
+    }
+
     const parsed = JSON.parse(jsonText);
     if (!Array.isArray(parsed)) {
       logger.warn("Claude returned non-array JSON", { type: typeof parsed });
