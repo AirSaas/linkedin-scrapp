@@ -36,10 +36,12 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
+- `trigger/import-circle-posts.ts` — weekly sync of Circle posts + comments from `ca-vient-de-sortir` space → Supabase `circle_posts` (tchat-support-sync project), incremental via `circle_sync_cursor`
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
 - `trigger/lib/crisp-supabase.ts` — Supabase client for tchat-support-sync project `oqiowupiczgrezgyopfm` (lazy-init, dedicated env vars)
+- `trigger/lib/circle-supabase.ts` — Supabase helpers for Circle posts sync (upsert posts, sync cursor) on tchat-support-sync project
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
 
 ## Task Flow Diagrams
@@ -56,6 +58,7 @@ flowchart LR
         HS_I(HubSpot API)
         MJ(Modjo API)
         CR(Crisp API)
+        CI(Circle API)
     end
 
     subgraph dst ["Destinations"]
@@ -91,6 +94,8 @@ flowchart LR
     BCS --> SB_CR & SL
     DBCS --> SB_CR & SL
     SCS --> SB_CR & SL
+    CI --> ICP[import-circle-posts]
+    ICP --> SB_CR
     WUR --> SL
 ```
 
@@ -411,6 +416,27 @@ flowchart TD
     L --> M{{Slack: script_logs if errors}}
 ```
 
+### `import-circle-posts` (weekly Friday 8h)
+
+```mermaid
+flowchart TD
+    A([Cron vendredi 8h]) --> B[Lire circle_sync_cursor]
+    B --> C[Circle API: getSpaceBySlug]
+    C --> D{Paginer posts<br/>published + draft}
+    D --> E{Pour chaque post}
+    E --> F{updated_at<br/>> curseur ?}
+    F -->|Non| G[Skip]
+    F -->|Oui| H{comments_count > 0 ?}
+    H -->|Non| I[mapPostToRow<br/>comments = null]
+    H -->|Oui| J[Fetch comments paginé<br/>Circle API]
+    J --> K[mapPostToRow<br/>+ comments JSON]
+    I & K --> L[Upsert circle_posts]
+    D -->|All done| M[Update circle_sync_cursor]
+    M --> N{Erreurs ?}
+    N -->|Oui| O{{sendErrorToScriptLogs}}
+    N -->|Non| P[Done]
+```
+
 ### `weekly-unanswered-recap` (weekly Friday 8h30)
 
 ```mermaid
@@ -616,6 +642,25 @@ flowchart TD
 - `last_run_at`: ISO timestamp of last actual batch execution (used for 25h gap check)
 - `is_done`: true when 3 empty pages found (no more conversations to import)
 
+### `circle_posts`
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
+- Circle posts imported weekly (from `import-circle-posts`)
+- PK: `id` (Circle post ID)
+- `space_slug`, `space_id`, `space_name`: Circle space info
+- `body_html`: HTML content, `tiptap_body`: TipTap JSON, `body_plain_text`: plain text
+- `images`: jsonb (gallery + inline TipTap images), `attachments`: jsonb
+- `comments`: jsonb (all comments with nested replies, fetched from Circle API)
+- `comments_count`, `likes_count`: counters from Circle
+- `user_id`, `user_name`, `user_email`: post author
+- `published_at`, `created_at`, `updated_at`: Circle timestamps
+- `last_synced_at`: last sync timestamp
+
+### `circle_sync_cursor`
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
+- Sync cursor for incremental Circle import (from `import-circle-posts`)
+- PK: `space_slug`
+- `last_synced_at`: ISO timestamp of latest `updated_at` seen
+
 ## External APIs (non-Unipile)
 
 - **LGM (LaGrowthMachine)**: `POST https://apiv2.lagrowthmachine.com/flow/leads?apikey=X` — send leads with audience name. Env var: `LGM_API_KEY`
@@ -629,6 +674,7 @@ flowchart TD
 - **Modjo**: `POST https://api.modjo.ai/v1/calls/exports` — export calls with transcripts, speakers, HubSpot relations. Auth: `X-API-KEY` header. Env var: `MODJO_API_KEY`
 - **LangGraph**: `POST {LANGGRAPH_BASE_URL}/runs` — async agent run with `{ assistant_id: "full_pipeline", input: { contact_data: payload } }`. Auth: `x-api-key` header. Env vars: `LANGGRAPH_BASE_URL` (prod/staging URLs differ), `LANGGRAPH_API_KEY`
 - **Crisp**: `GET/POST https://api.crisp.chat/v1/website/{websiteId}/...` — conversations, messages, metas. Auth: HTTP Basic (`CRISP_IDENTIFIER:CRISP_KEY`), header `X-Crisp-Tier: plugin`. Rate limit: 500 req/24h. Env vars: `CRISP_IDENTIFIER`, `CRISP_KEY`, `CRISP_WEBSITE_ID`
+- **Circle**: `GET https://{CIRCLE_COMMUNITY_HOST}/api/admin/v2/...` — spaces, posts, comments. Auth: `Authorization: Token {CIRCLE_API_TOKEN}`. Rate limit: 300 req/min. Env vars: `CIRCLE_API_TOKEN`, `CIRCLE_COMMUNITY_HOST`
 
 ## Unipile API
 
