@@ -30,6 +30,7 @@ const EXCLUDED_SENDER_DOMAINS = new Set([
   "figma.com",        // design tool notifications
   "github.com",       // code platform notifications
   "slack.com",        // messaging platform notifications
+  "fyxer.com",        // AI email assistant
 ]);
 
 const RATE_LIMIT = {
@@ -66,6 +67,7 @@ interface UnansweredItem {
   senderName: string;
   senderEmail?: string;
   senderLinkedInUrl?: string;
+  emailThreadId?: string;
   subject?: string;
   preview: string;
   messages: { from: string; text: string }[];
@@ -441,6 +443,7 @@ async function getEmailUnanswered(
       teamMemberKey: account.ghost_genius_id,
       senderName: latest.from_attendee.display_name || latest.from_attendee.identifier,
       senderEmail: latest.from_attendee.identifier,
+      emailThreadId: threadId,
       subject: latest.subject,
       preview: (latest.body_plain || latest.subject || "").substring(0, 100),
       messages: aiMessages,
@@ -700,9 +703,8 @@ async function sendSlackRecap(
         const emailDisplay = item.senderEmail ? ` (${item.senderEmail})` : "";
         text += `• *${item.senderName}*${emailDisplay} — ${item.summary}`;
         const links: string[] = [];
-        if (item.senderEmail && item.subject) {
-          const gmailQuery = encodeURIComponent(`from:${item.senderEmail} subject:${item.subject}`);
-          links.push(`<https://mail.google.com/mail/u/0/#search/${gmailQuery}|Gmail>`);
+        if (item.emailThreadId) {
+          links.push(`<https://mail.google.com/mail/u/0/#inbox/${item.emailThreadId}|Gmail>`);
         }
         if (item.senderLinkedInUrl) {
           links.push(`<${item.senderLinkedInUrl}|LinkedIn>`);
