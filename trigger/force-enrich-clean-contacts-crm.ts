@@ -12,7 +12,7 @@ const ENRICH_TOKEN =
 
 const DEFAULTS = {
   maxContacts: 40_000,
-  delayMs: 600,
+  delayMs: 4000,
   staleDays: 60,
   dryRun: false,
 };
