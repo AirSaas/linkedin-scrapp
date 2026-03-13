@@ -39,6 +39,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/import-circle-posts.ts` — weekly sync of Circle posts + comments from `ca-vient-de-sortir` space → Supabase `circle_posts` (tchat-support-sync project), incremental via `circle_sync_cursor`
 - `trigger/generate-faq-document.ts` — manual task: reads `tchat_faq_extractions` (score >= 3), consolidates themes + deduplicates via Claude Opus in batches, generates structured Markdown FAQ document, saves to `tchat_faq_documents`
+- `trigger/audit-circle-documentation.ts` — manual task: cross-references FAQ extractions with Circle articles, produces audit report with article rewrites (image-preserving), new article drafts, and orphan detection. Resume support via `tchat_doc_audit_items`. Saves to `tchat_faq_documents` with type `doc_audit`
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
@@ -102,6 +103,8 @@ flowchart LR
     ICP --> SB_CR
     SB_CR --> GFD[generate-faq-document]
     GFD --> SB_CR & SL
+    SB_CR --> ACD[audit-circle-documentation]
+    ACD --> SB_CR & SL
     WUR --> SL
 ```
 
@@ -475,6 +478,33 @@ flowchart TD
     J -->|Errors| M
 ```
 
+### `audit-circle-documentation` (manual)
+
+```mermaid
+flowchart TD
+    A([Manual trigger]) --> B[Fetch tchat_faq_extractions<br/>score >= 3]
+    B --> C[Fetch circle_posts<br/>published]
+    C --> D[Extraire URLs Circle<br/>référencées dans FAQ]
+
+    D --> E{Axe A: Pour chaque<br/>article référencé}
+    E --> F{Déjà traité<br/>tchat_doc_audit_items ?}
+    F -->|Oui| G[Skip resume]
+    F -->|Non| H[Claude Opus:<br/>diagnostic + réécriture<br/>avec IMAGE_N placeholders]
+    H --> I[Insert tchat_doc_audit_items<br/>status = done]
+
+    D --> J{Axe B: Thèmes FAQ<br/>sans article Circle}
+    J --> K{>= 3 entrées ?}
+    K -->|Non| L[Skip]
+    K -->|Oui| M[Claude Opus:<br/>brouillon nouvel article]
+    M --> N[Insert tchat_doc_audit_items]
+
+    D --> O[Axe C: Articles orphelins<br/>non référencés dans FAQ]
+
+    I & N & O --> P[Assembler rapport Markdown<br/>avec TOC]
+    P --> Q[Insert tchat_faq_documents<br/>type = doc_audit]
+    Q --> R{{Slack: script_logs}}
+```
+
 ### `weekly-unanswered-recap` (weekly Friday 8h30)
 
 ```mermaid
@@ -722,6 +752,19 @@ flowchart TD
 - `markdown`: full Markdown document text
 - `stats`: jsonb `{ total_entries_before, total_entries_after, total_themes, min_score }`
 - `metadata`: jsonb `{ batch_count, generation_duration_ms }`
+- `type`: text (`faq` default, `doc_audit` for audit reports) — versions are per type
+
+### `tchat_doc_audit_items`
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
+- Individual audit results for resume support (from `audit-circle-documentation`)
+- PK: `id` (serial)
+- `audit_run_id`: text, groups items by run
+- `article_url`: article URL (null for new article drafts)
+- `article_name`: article title
+- `audit_type`: `update`, `create`, or `orphan`
+- `analysis`: full Opus analysis text (diagnostic + rewrite)
+- `image_mapping`: jsonb, `[IMAGE_N]` → original URL mapping
+- `status`: `pending` or `done`
 
 ## External APIs (non-Unipile)
 

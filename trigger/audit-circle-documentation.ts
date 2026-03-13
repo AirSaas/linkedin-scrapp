@@ -97,10 +97,10 @@ RÈGLES :
 export const auditCircleDocumentation = task({
   id: "audit-circle-documentation",
   maxDuration: 7200, // 2h
-  run: async (payload: { minScore?: number; dryRun?: boolean }) => {
+  run: async (payload?: { minScore?: number; dryRun?: boolean }) => {
     const startTime = Date.now();
-    const minScore = payload.minScore ?? DEFAULT_MIN_SCORE;
-    const dryRun = payload.dryRun ?? false;
+    const minScore = payload?.minScore ?? DEFAULT_MIN_SCORE;
+    const dryRun = payload?.dryRun ?? false;
     const auditRunId = crypto.randomUUID();
     const errors: TaskResultGroup[] = [];
 
