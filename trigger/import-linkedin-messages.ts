@@ -276,6 +276,7 @@ export const importLinkedinMessagesTask = schedules.task({
           } catch (err) {
             const m = err instanceof Error ? err.message : String(err);
             logger.error(`HubSpot retry error for ${msg.id}: ${m}`);
+            errorDetails.push({ type: "HubSpot Retry", code: "exception", message: m, profile: msg.id });
           }
           await sleep(RATE_LIMIT.BETWEEN_MESSAGES);
         }

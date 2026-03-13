@@ -93,25 +93,29 @@ export const backfillHubspotMessagesTask = task({
       await sleep(BETWEEN_MESSAGES);
     }
 
-    // 4. Send recap to Slack
-    await sendErrorToScriptLogs("Backfill HubSpot Messages", [{
-      label: "Messages",
-      inserted: totalSent,
-      skipped: totalSkipped,
-      errors: errorDetails,
-    }]);
-
     const noProgress = totalSent === 0;
+    const isLastBatch = messages.length < BATCH_SIZE || noProgress;
+
     const summary = {
       success: true,
       totalProcessed: messages.length,
       totalSent,
       totalSkipped,
       errors: errorDetails.length,
-      done: messages.length < BATCH_SIZE || noProgress,
+      done: isLastBatch,
     };
 
     logger.info("=== SUMMARY ===", summary);
+
+    // 4. Send recap to Slack only on last batch (avoid spam during self-chain)
+    if (isLastBatch) {
+      await sendErrorToScriptLogs("Backfill HubSpot Messages", [{
+        label: "Messages",
+        inserted: totalSent,
+        skipped: totalSkipped,
+        errors: errorDetails,
+      }]);
+    }
 
     // 5. Self-trigger next batch if more messages remain AND we made progress
     if (messages.length >= BATCH_SIZE && !noProgress) {
