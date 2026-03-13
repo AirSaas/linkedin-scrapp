@@ -24,7 +24,8 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/get-strategic-connections.ts` — scrapes Sales Navigator saved searches for new concurrent profiles
 - `trigger/get-strategic-people.ts` — scrapes Sales Navigator saved searches for strategic people (CIO, PMO, etc.)
 - `trigger/get-team-connections.ts` — fetches 1st-degree LinkedIn connections for all team members
-- `trigger/lgm-process-intent-events.ts` — processes J-1 intent events + concurrent contacts → routes to LGM or HubSpot, sends grouped Slack recap. Also exports `lgm-process-intent-events-10-days` backfill task (same logic, 10-day lookback)
+- `trigger/lgm-process-intent-events.ts` — processes J-1 intent events + concurrent contacts → routes to LGM or HubSpot, sends grouped Slack recap. Also exports `lgm-process-intent-events-10-days` backfill task (same logic, 10-day lookback). Logs every routing decision to `lgm_send_log` for audit.
+- `trigger/audit-lgm-sends.ts` — weekly audit: queries `lgm_send_log` (7 days), compares with LGM audience sizes via API, posts report to `script_logs` Slack
 - `trigger/hubspot-cleanup-email-associations.ts` — removes parasitic email-contact associations in HubSpot (emails with >3 contacts where contact not in from/to/cc/bcc)
 - `trigger/import-linkedin-messages.ts` — imports LinkedIn messages from last 24h via Unipile → Supabase, sends 1:1 messages to HubSpot (communication) + Zapier webhook
 - `trigger/weekly-meetings-recap.ts` — weekly Monday recap of HubSpot meetings in SQL pipeline, enriched with AI (Anthropic Sonnet) and sent to Slack
@@ -84,7 +85,9 @@ flowchart LR
     GSC --> SB_O & SL
     GSP --> SB_O & SL
     GTC --> SB_O & SL
-    LPI --> LGM_O & HS_O & SL
+    LPI --> LGM_O & HS_O & SB_O & SL
+    SB --> ALS[audit-lgm-sends]
+    ALS --> SL
     HCE --> HS_O & SL
     ILM --> SB_O & HS_O & ZP & SL
     WMR --> SL
@@ -226,6 +229,19 @@ flowchart TD
     I -->|No| K[Skip: cancelled]
 
     H -->|No| L[HubSpot POST:<br/>create contact<br/>assign Bertran + activate]
+```
+
+### `audit-lgm-sends` (weekly Monday)
+
+```mermaid
+flowchart TD
+    A([Cron hebdo lundi]) --> B[Query lgm_send_log<br/>7 derniers jours]
+    B --> C{Logs trouvés ?}
+    C -->|Non| D{{Slack: script_logs<br/>aucun envoi}}
+    C -->|Oui| E[Grouper par destination<br/>compter: total, created, duplicate, failed]
+    E --> F[GET /flow/audiences<br/>LGM API — tailles actuelles]
+    F --> G[Construire rapport comparatif<br/>audiences + HubSpot + skipped]
+    G --> H{{Slack: script_logs}}
 ```
 
 ### `hubspot-cleanup-email-associations` (daily)
@@ -595,6 +611,19 @@ flowchart TD
 ### `PRC_CONTACTS`
 - Read-only: lookup `CONTACT_HUBSPOT_ID` by `CONTACT_LINKEDIN_PROFILE_URL`
 - Used by `lgm-process-intent-events` for concurrent contacts HubSpot routing
+
+### `lgm_send_log`
+- Audit log for every routing decision in `lgm-process-intent-events` (from both intent events and concurrent contacts)
+- PK: `id` (bigserial)
+- `destination`: audience name for LGM sends, or `HUBSPOT_ACTIVATE` / `HUBSPOT_ASSIGN` / `HUBSPOT_CREATE` / `SKIPPED` / `EXCLUDED` / `UNMAPPED`
+- `source`: `intent_event` or `concurrent_contact`
+- `lgm_http_status`, `lgm_response_msg`, `lgm_lead_id`: LGM API response details (null for non-LGM routes)
+- `hubspot_contact_id`, `hubspot_success`: HubSpot routing details (null for non-HubSpot routes)
+- `connected_with_intent_owner`: SNAPSHOT at processing time (important: this field is live in PRC_INTENT_EVENTS)
+- `skip_reason`: `excluded_profile` / `unmapped_key` / `cancel_agent_ia` / `cross_owner` / `no_hubspot_id` / `unknown_page_origin`
+- `run_id`: UUID generated per task run for correlation
+- Indexed on `(created_at, destination)`
+- Used by `audit-lgm-sends` for weekly reporting
 
 ### `scrapped_linkedin_threads`
 - LinkedIn messaging threads (from `import-linkedin-messages`)

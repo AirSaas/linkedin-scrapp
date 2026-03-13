@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { logger, metadata, schedules } from "@trigger.dev/sdk/v3";
 import { supabase } from "./lib/supabase.js";
 import { sleep } from "./lib/utils.js";
@@ -20,6 +21,7 @@ const SLACK_CHANNEL_LOGERROR_ID = "C0AAXKPRKT8";
 const EXCLUDED_LINKEDIN_PROFILES = [
   "https://www.linkedin.com/in/stephan-boisson-3ba61950/",
   "https://www.linkedin.com/in/benitodiz/",
+  "https://www.linkedin.com/in/bertranruiz/",
 ];
 
 // Mapping: intent_owner|eventType|connected_status → action
@@ -149,7 +151,8 @@ export const lgmProcessIntentEventsTask = schedules.task({
   id: "lgm-process-intent-events",
   maxDuration: 600,
   run: async () => {
-    logger.info("=== START lgm-process-intent-events ===");
+    currentRunId = crypto.randomUUID();
+    logger.info(`=== START lgm-process-intent-events === runId=${currentRunId}`);
 
     // 1. Get team members
     const teamMembers = await getWorkspaceTeamMembers();
@@ -258,7 +261,8 @@ export const lgmProcessIntentEvents10DaysTask = schedules.task({
   id: "lgm-process-intent-events-10-days",
   maxDuration: 600,
   run: async () => {
-    logger.info("=== START lgm-process-intent-events-10-days (backfill) ===");
+    currentRunId = crypto.randomUUID();
+    logger.info(`=== START lgm-process-intent-events-10-days (backfill) === runId=${currentRunId}`);
 
     const lookbackDays = 10;
 
@@ -510,9 +514,17 @@ function buildConcurrentLgmPayload(
   return payload;
 }
 
+interface LgmResponse {
+  success: boolean;
+  error?: string;
+  httpStatus?: number;
+  message?: string;
+  leadId?: string;
+}
+
 async function sendToLgm(
   payload: Record<string, string>
-): Promise<{ success: boolean; error?: string }> {
+): Promise<LgmResponse> {
   const apiKey = process.env.LGM_API_KEY ?? "";
   const url = `${LGM_API_URL}?apikey=${apiKey}`;
 
@@ -523,21 +535,72 @@ async function sendToLgm(
       body: JSON.stringify(payload),
     });
 
+    const text = await res.text();
+    let message: string | undefined;
+    let leadId: string | undefined;
+    try {
+      const json = JSON.parse(text);
+      message = json.message ?? json.msg;
+      leadId = json.leadId ?? json.lead_id ?? json.id;
+    } catch {
+      message = text;
+    }
+
     if (res.ok) {
       logger.info(
-        `LGM OK - Audience: ${payload.audience}, Lead: ${payload.firstname} ${payload.lastname}`
+        `LGM OK - Audience: ${payload.audience}, Lead: ${payload.firstname} ${payload.lastname} — ${message ?? ""}`
       );
-      return { success: true };
+      return { success: true, httpStatus: res.status, message, leadId };
     } else {
-      const text = await res.text();
       logger.error(`LGM error ${res.status}: ${text}`);
-      return { success: false, error: `${res.status} — ${text}` };
+      return { success: false, error: `${res.status} — ${text}`, httpStatus: res.status, message };
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error(`LGM exception: ${msg}`);
     return { success: false, error: msg };
   }
+}
+
+// ============================================
+// AUDIT LOG HELPER
+// ============================================
+let currentRunId: string | undefined;
+
+interface LogEntry {
+  linkedin_url?: string;
+  first_name?: string;
+  last_name?: string;
+  company?: string;
+  destination: string;
+  source: "intent_event" | "concurrent_contact";
+  lgm_http_status?: number;
+  lgm_response_msg?: string;
+  lgm_lead_id?: string;
+  hubspot_contact_id?: string;
+  hubspot_success?: boolean;
+  connected_with_intent_owner?: boolean;
+  intent_owner?: string;
+  event_type?: string;
+  business_owner?: string;
+  skip_reason?: string;
+  task_id?: string;
+}
+
+function logRoutingDecision(entry: LogEntry): void {
+  const row = {
+    ...entry,
+    run_id: currentRunId,
+  };
+  // Fire-and-forget — never block the main flow
+  (async () => {
+    try {
+      const { error } = await supabase.from("lgm_send_log").insert(row);
+      if (error) logger.warn(`lgm_send_log insert failed: ${error.message}`);
+    } catch (err) {
+      logger.warn(`lgm_send_log insert exception: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  })();
 }
 
 // ============================================
@@ -820,8 +883,23 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
     const fullName =
       `${record.CONTACT_FIRST_NAME ?? ""} ${record.CONTACT_LAST_NAME ?? ""}`.trim();
 
+    // Shared base for audit log entries
+    const logBase = {
+      linkedin_url: record.CONTACT_LINKEDIN_PROFILE_URL,
+      first_name: record.CONTACT_FIRST_NAME,
+      last_name: record.CONTACT_LAST_NAME,
+      company: record.COMPANY_NAME,
+      source: "intent_event" as const,
+      connected_with_intent_owner: record.CONNECTED_WITH_INTENT_OWNER,
+      intent_owner: record.INTENT_OWNER,
+      event_type: record.INTENT_EVENT_TYPE,
+      business_owner: record.BUSINESS_OWNER,
+      task_id: "lgm-process-intent-events",
+    };
+
     if (isExcludedProfile(record.CONTACT_LINKEDIN_PROFILE_URL)) {
       logger.info(`Excluded: ${fullName}`);
+      logRoutingDecision({ ...logBase, destination: "EXCLUDED", skip_reason: "excluded_profile" });
       excluded++;
       continue;
     }
@@ -838,6 +916,10 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
         action = pageAudience;
         const lgmPayload = buildIntentEventLgmPayload(record, pageAudience);
         const lgmResult = await sendToLgm(lgmPayload);
+        logRoutingDecision({
+          ...logBase, destination: pageAudience,
+          lgm_http_status: lgmResult.httpStatus, lgm_response_msg: lgmResult.message, lgm_lead_id: lgmResult.leadId,
+        });
         if (lgmResult.success) {
           lgmSuccess++;
         } else {
@@ -847,6 +929,7 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
         await sleep(RATE_LIMIT.PAUSE_BETWEEN_API_CALLS);
       } else {
         logger.warn(`Unknown Follow Page origin: "${pageOrigin}" for ${fullName}`);
+        logRoutingDecision({ ...logBase, destination: "SKIPPED", skip_reason: "unknown_page_origin" });
         lgmSkipped++;
         shouldSendSlack = false;
       }
@@ -889,6 +972,7 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
 
       if (!contactHubspotId) {
         logger.info(`HubSpot skip - No CONTACT_HUBSPOT_ID for ${fullName}`);
+        logRoutingDecision({ ...logBase, destination: "SKIPPED", skip_reason: "no_hubspot_id" });
         hubspotSkipped++;
         shouldSendSlack = false;
       } else {
@@ -903,6 +987,10 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
               contactHubspotId,
               intentOwnerHubspotId
             );
+            logRoutingDecision({
+              ...logBase, destination: "HUBSPOT_ASSIGN",
+              hubspot_contact_id: contactHubspotId, hubspot_success: assignResult.success,
+            });
             if (assignResult.success) {
               hubspotSuccess++;
             } else {
@@ -911,6 +999,10 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             shouldSendSlack = assignResult.success;
           } else {
             logger.warn(`No HubSpot ID found for intent owner: ${intentOwner}`);
+            logRoutingDecision({
+              ...logBase, destination: "HUBSPOT_ASSIGN",
+              hubspot_contact_id: contactHubspotId, hubspot_success: false,
+            });
             hubspotFailed++;
             shouldSendSlack = false;
           }
@@ -920,6 +1012,10 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             await getHubspotContactCancelStatus(contactHubspotId);
 
           if (!getResult.success) {
+            logRoutingDecision({
+              ...logBase, destination: "HUBSPOT_ACTIVATE",
+              hubspot_contact_id: contactHubspotId, hubspot_success: false,
+            });
             hubspotFailed++;
             shouldSendSlack = false;
           } else if (
@@ -930,11 +1026,19 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             logger.info(
               `HubSpot skip - cancel_agent_ia_activated non-empty for ${fullName}`
             );
+            logRoutingDecision({
+              ...logBase, destination: "SKIPPED", skip_reason: "cancel_agent_ia",
+              hubspot_contact_id: contactHubspotId,
+            });
             hubspotSkipped++;
             shouldSendSlack = false;
           } else {
             const updateResult =
               await updateHubspotContactAgentActivated(contactHubspotId);
+            logRoutingDecision({
+              ...logBase, destination: "HUBSPOT_ACTIVATE",
+              hubspot_contact_id: contactHubspotId, hubspot_success: updateResult.success,
+            });
             if (updateResult.success) {
               hubspotSuccess++;
             } else {
@@ -944,10 +1048,13 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
           }
         } else {
           // Cas 3: BUSINESS_OWNER ≠ INTENT_OWNER → skip for now
-          // TODO: decide how to handle cross-owner intent events
           logger.info(
             `HubSpot skip - BO(${businessOwner}) ≠ IO(${intentOwner}) for ${fullName}`
           );
+          logRoutingDecision({
+            ...logBase, destination: "SKIPPED", skip_reason: "cross_owner",
+            hubspot_contact_id: contactHubspotId,
+          });
           hubspotSkipped++;
           shouldSendSlack = false;
         }
@@ -957,6 +1064,10 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
       // Not connected with intent owner → LGM
       const lgmPayload = buildIntentEventLgmPayload(record, action);
       const lgmResult = await sendToLgm(lgmPayload);
+      logRoutingDecision({
+        ...logBase, destination: action,
+        lgm_http_status: lgmResult.httpStatus, lgm_response_msg: lgmResult.message, lgm_lead_id: lgmResult.leadId,
+      });
 
       if (lgmResult.success) {
         lgmSuccess++;
@@ -967,6 +1078,7 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
       await sleep(RATE_LIMIT.PAUSE_BETWEEN_API_CALLS);
     } else {
       // action === null → skip (unmapped key)
+      logRoutingDecision({ ...logBase, destination: "UNMAPPED", skip_reason: "unmapped_key" });
       lgmSkipped++;
       shouldSendSlack = false;
     }
@@ -1028,8 +1140,18 @@ async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays
       "(unknown)";
     const salesNavSource = record.sales_nav_source ?? "unknown";
 
+    const logBase = {
+      linkedin_url: record.linkedin_profile_url,
+      first_name: record.first_name,
+      last_name: record.last_name,
+      company: record.company_name,
+      source: "concurrent_contact" as const,
+      task_id: "lgm-process-intent-events",
+    };
+
     if (isExcludedProfile(record.linkedin_profile_url)) {
       logger.info(`Excluded: ${fullName}`);
+      logRoutingDecision({ ...logBase, destination: "EXCLUDED", skip_reason: "excluded_profile" });
       excluded++;
       continue;
     }
@@ -1045,6 +1167,10 @@ async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays
         "bertran_ruiz_concurrent_unknown";
       const lgmPayload = buildConcurrentLgmPayload(record, audience);
       const lgmResult = await sendToLgm(lgmPayload);
+      logRoutingDecision({
+        ...logBase, destination: audience,
+        lgm_http_status: lgmResult.httpStatus, lgm_response_msg: lgmResult.message, lgm_lead_id: lgmResult.leadId,
+      });
 
       if (lgmResult.success) {
         lgmSuccess++;
@@ -1064,6 +1190,10 @@ async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays
           await getHubspotContactCancelStatus(existingHubspotId);
 
         if (!getResult.success) {
+          logRoutingDecision({
+            ...logBase, destination: "HUBSPOT_ACTIVATE",
+            hubspot_contact_id: existingHubspotId, hubspot_success: false,
+          });
           hubspotUpdateFailed++;
           errors.push(`HubSpot Update fail: ${fullName}`);
         } else if (
@@ -1074,10 +1204,18 @@ async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays
           logger.info(
             `HubSpot skip - cancel non-empty for ${fullName}`
           );
+          logRoutingDecision({
+            ...logBase, destination: "SKIPPED", skip_reason: "cancel_agent_ia",
+            hubspot_contact_id: existingHubspotId,
+          });
           hubspotUpdateSkipped++;
         } else {
           const updateResult =
             await updateHubspotContactAgentActivated(existingHubspotId);
+          logRoutingDecision({
+            ...logBase, destination: "HUBSPOT_ACTIVATE",
+            hubspot_contact_id: existingHubspotId, hubspot_success: updateResult.success,
+          });
           if (updateResult.success) {
             hubspotUpdateSuccess++;
           } else {
@@ -1091,6 +1229,10 @@ async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays
           record,
           bertranInfo.hubspotOwnerId
         );
+        logRoutingDecision({
+          ...logBase, destination: "HUBSPOT_CREATE",
+          hubspot_success: createResult.success,
+        });
         if (createResult.success) {
           hubspotCreateSuccess++;
         } else {
