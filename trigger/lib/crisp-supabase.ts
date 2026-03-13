@@ -365,6 +365,95 @@ export async function upsertFaqExtraction(
 }
 
 // ============================================
+// FAQ document generation
+// ============================================
+
+export interface FaqEntry {
+  session_id: string;
+  explicit_question: string;
+  underlying_need: string;
+  theme: string;
+  product_terms: string[];
+  signal: string;
+  faq_score: number;
+  faq_score_reason: string;
+  suggested_faq_title: string;
+  suggested_faq_answer: string;
+  source_quotes: string[];
+  circle_references: Array<{ title: string; url: string }>;
+  [key: string]: unknown;
+}
+
+export async function getAllFaqExtractions(minScore: number): Promise<FaqEntry[]> {
+  const sb = getCrispSupabase();
+  const PAGE_SIZE = 1000;
+  const allEntries: FaqEntry[] = [];
+  let offset = 0;
+
+  while (true) {
+    const { data, error } = await sb
+      .from("tchat_faq_extractions")
+      .select("session_id, extractions")
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (error) throw new Error(`getAllFaqExtractions: ${error.message}`);
+    if (!data || data.length === 0) break;
+
+    for (const row of data) {
+      const extractions = typeof row.extractions === "string"
+        ? JSON.parse(row.extractions)
+        : row.extractions;
+
+      if (!Array.isArray(extractions)) continue;
+
+      for (const entry of extractions) {
+        if ((entry.faq_score ?? 0) >= minScore) {
+          allEntries.push({ ...entry, session_id: row.session_id });
+        }
+      }
+    }
+
+    if (data.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
+  }
+
+  return allEntries;
+}
+
+export async function insertFaqDocument(
+  markdown: string,
+  modelUsed: string,
+  stats: Record<string, unknown>,
+  docMetadata: Record<string, unknown>
+): Promise<number> {
+  const sb = getCrispSupabase();
+
+  // Get next version
+  const { data: maxRow } = await sb
+    .from("tchat_faq_documents")
+    .select("version")
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const nextVersion = (maxRow?.version ?? 0) + 1;
+
+  const { error } = await sb
+    .from("tchat_faq_documents")
+    .insert({
+      version: nextVersion,
+      generated_at: new Date().toISOString(),
+      model_used: modelUsed,
+      markdown,
+      stats,
+      metadata: docMetadata,
+    });
+
+  if (error) throw new Error(`insertFaqDocument: ${error.message}`);
+  return nextVersion;
+}
+
+// ============================================
 // Stats
 // ============================================
 

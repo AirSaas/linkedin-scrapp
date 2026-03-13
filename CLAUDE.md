@@ -37,6 +37,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/import-circle-posts.ts` — weekly sync of Circle posts + comments from `ca-vient-de-sortir` space → Supabase `circle_posts` (tchat-support-sync project), incremental via `circle_sync_cursor`
+- `trigger/generate-faq-document.ts` — manual task: reads `tchat_faq_extractions` (score >= 3), consolidates themes + deduplicates via Claude Opus in batches, generates structured Markdown FAQ document, saves to `tchat_faq_documents`
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
@@ -96,6 +97,8 @@ flowchart LR
     SCS --> SB_CR & SL
     CI --> ICP[import-circle-posts]
     ICP --> SB_CR
+    SB_CR --> GFD[generate-faq-document]
+    GFD --> SB_CR & SL
     WUR --> SL
 ```
 
@@ -437,6 +440,25 @@ flowchart TD
     N -->|Non| P[Done]
 ```
 
+### `generate-faq-document` (manual)
+
+```mermaid
+flowchart TD
+    A([Manual trigger]) --> B[Fetch tchat_faq_extractions<br/>faq_score >= 3]
+    B --> C{Entries > 0 ?}
+    C -->|Non| D[Return early]
+    C -->|Oui| E[Split en batches de 100]
+    E --> F{Phase 1: Pour chaque batch}
+    F --> G[Claude Opus streaming:<br/>consolidation thèmes + dedup]
+    G --> H[Parse JSON consolidé]
+    F -->|All done| I[Merge sorties Phase 1]
+    I --> J[Phase 2: Claude Opus streaming:<br/>génération Markdown]
+    J --> K[Insert tchat_faq_documents]
+    K --> L{{Slack: script_logs}}
+    F -->|Errors| M{{sendErrorToScriptLogs}}
+    J -->|Errors| M
+```
+
 ### `weekly-unanswered-recap` (weekly Friday 8h30)
 
 ```mermaid
@@ -660,6 +682,17 @@ flowchart TD
 - Sync cursor for incremental Circle import (from `import-circle-posts`)
 - PK: `space_slug`
 - `last_synced_at`: ISO timestamp of latest `updated_at` seen
+
+### `tchat_faq_documents`
+- **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
+- Generated FAQ documents (from `generate-faq-document`)
+- PK: `id` (serial)
+- `version`: auto-incrementing version number
+- `generated_at`: ISO timestamp
+- `model_used`: Claude model used (e.g. `claude-opus-4-20250514`)
+- `markdown`: full Markdown document text
+- `stats`: jsonb `{ total_entries_before, total_entries_after, total_themes, min_score }`
+- `metadata`: jsonb `{ batch_count, generation_duration_ms }`
 
 ## External APIs (non-Unipile)
 
