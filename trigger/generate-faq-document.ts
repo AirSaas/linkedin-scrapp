@@ -7,7 +7,8 @@ import { getAllFaqExtractions, insertFaqDocument, type FaqEntry } from "./lib/cr
 // CONFIGURATION
 // ============================================
 
-const MODEL = "claude-opus-4-20250514";
+const OPUS_MODEL = "claude-opus-4-20250514";
+const SONNET_MODEL = "claude-sonnet-4-20250514";
 const MAX_TOKENS_PER_THEME = 8000;
 const TEMPERATURE = 0.3;
 const DEFAULT_MIN_SCORE = 3;
@@ -183,7 +184,7 @@ Légende JSON : t=titre, a=réponse, n=besoin sous-jacent, s=score, sq=citations
 
 ${JSON.stringify(compact)}`;
 
-        const sectionMd = await callClaudeText(client, MODEL, THEME_SYSTEM_PROMPT, userPrompt, MAX_TOKENS_PER_THEME);
+        const sectionMd = await callClaudeText(client, SONNET_MODEL, THEME_SYSTEM_PROMPT, userPrompt, MAX_TOKENS_PER_THEME);
 
         if (sectionMd) {
           const questionCount = (sectionMd.match(/^### /gm) || []).length;
@@ -247,7 +248,7 @@ ${JSON.stringify(compact)}`;
         generation_duration_ms: Date.now() - startTime,
       };
 
-      const version = await insertFaqDocument(markdown, MODEL, stats, docMetadata);
+      const version = await insertFaqDocument(markdown, `${OPUS_MODEL} + ${SONNET_MODEL}`, stats, docMetadata);
       logger.info(`Saved FAQ document v${version} to Supabase`);
 
       // 6. Slack notification
@@ -326,7 +327,7 @@ async function callClaudeForThemeConsolidation(
 ): Promise<Record<string, string>> {
   const callOnce = async () => {
     const stream = client.messages.stream({
-      model: MODEL,
+      model: OPUS_MODEL,
       max_tokens: 16000,
       temperature: 0.1,
       system: systemPrompt,
