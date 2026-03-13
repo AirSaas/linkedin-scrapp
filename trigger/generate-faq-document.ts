@@ -178,14 +178,28 @@ export const generateFaqDocument = task({
         };
       }
 
-      // 3. For each theme group: one Sonnet call (dedup + markdown section)
+      // 3. Process theme groups
+      // Themes with <=2 entries: format directly in code (no AI needed)
+      // Themes with 3+ entries: one Sonnet call for dedup + markdown
+      const AI_THRESHOLD = 3; // Only call Claude for themes with 3+ entries
       const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
       const sections: Array<{ theme: string; markdown: string; entryCount: number }> = [];
       let totalEntriesAfterDedup = 0;
+      let aiCallCount = 0;
 
       for (let i = 0; i < sortedThemes.length; i++) {
         const [theme, entries] = sortedThemes[i];
-        logger.info(`Processing theme ${i + 1}/${sortedThemes.length}: "${theme}" (${entries.length} entries)`);
+
+        if (entries.length < AI_THRESHOLD) {
+          // Format directly — no Claude call needed
+          const sectionMd = formatEntriesDirectly(entries);
+          totalEntriesAfterDedup += entries.length;
+          sections.push({ theme, markdown: sectionMd, entryCount: entries.length });
+          continue;
+        }
+
+        aiCallCount++;
+        logger.info(`Processing theme ${aiCallCount} (${i + 1}/${sortedThemes.length}): "${theme}" (${entries.length} entries)`);
 
         // Compact JSON — no pretty-printing to save tokens
         const compact = entries.map((e) => ({
@@ -211,7 +225,10 @@ ${JSON.stringify(compact)}`;
           sections.push({ theme, markdown: sectionMd, entryCount: questionCount });
           logger.info(`  → ${entries.length} entries → ${questionCount} questions`);
         } else {
-          logger.error(`  → Failed for theme "${theme}"`);
+          logger.error(`  → Failed for theme "${theme}", falling back to direct format`);
+          const fallbackMd = formatEntriesDirectly(entries);
+          totalEntriesAfterDedup += entries.length;
+          sections.push({ theme, markdown: fallbackMd, entryCount: entries.length });
           errors.push({
             label: theme,
             inserted: 0,
@@ -220,6 +237,8 @@ ${JSON.stringify(compact)}`;
           });
         }
       }
+
+      logger.info(`Processed ${sortedThemes.length} themes (${aiCallCount} AI calls, ${sortedThemes.length - aiCallCount} direct format)`);
 
       // 4. Assemble final document
       const today = new Date().toISOString().split("T")[0];
@@ -307,6 +326,32 @@ ${JSON.stringify(compact)}`;
 // ============================================
 // HELPERS
 // ============================================
+
+function formatEntriesDirectly(entries: FaqEntry[]): string {
+  const lines: string[] = [];
+  for (const e of entries) {
+    lines.push(`### ${e.suggested_faq_title || "Question"}\n`);
+    lines.push(`${e.suggested_faq_answer || ""}\n`);
+
+    const quotes = (e.source_quotes || []).filter(Boolean);
+    const refs = (e.circle_references || []).filter((r) => r?.url);
+
+    if (quotes.length > 0 || refs.length > 0) {
+      lines.push(`<details>\n<summary>Sources</summary>\n`);
+      for (const q of quotes) {
+        lines.push(`> "${q}"\n`);
+      }
+      if (refs.length > 0) {
+        lines.push(`\n**Références Circle :**`);
+        for (const r of refs) {
+          lines.push(`- [${r.title}](${r.url})`);
+        }
+      }
+      lines.push(`\n</details>\n`);
+    }
+  }
+  return lines.join("\n");
+}
 
 async function callClaudeText(
   client: Anthropic,
