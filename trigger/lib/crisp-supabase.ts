@@ -454,6 +454,123 @@ export async function insertFaqDocument(
 }
 
 // ============================================
+// Doc audit items (resume support)
+// ============================================
+
+export interface DocAuditItem {
+  audit_run_id: string;
+  article_url: string | null;
+  article_name: string | null;
+  audit_type: string;
+  analysis: string;
+  image_mapping: Record<string, string> | null;
+  status: string;
+}
+
+export async function getCompletedAuditUrls(maxAgeHours: number = 24): Promise<Set<string>> {
+  const since = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
+  const { data } = await getCrispSupabase()
+    .from("tchat_doc_audit_items")
+    .select("article_url")
+    .eq("status", "done")
+    .gte("created_at", since);
+
+  return new Set((data || []).map((r) => r.article_url).filter(Boolean));
+}
+
+export async function insertAuditItem(item: DocAuditItem): Promise<void> {
+  const { error } = await getCrispSupabase()
+    .from("tchat_doc_audit_items")
+    .insert({
+      audit_run_id: item.audit_run_id,
+      article_url: item.article_url,
+      article_name: item.article_name,
+      audit_type: item.audit_type,
+      analysis: item.analysis,
+      image_mapping: item.image_mapping,
+      status: item.status,
+    });
+
+  if (error) throw new Error(`insertAuditItem: ${error.message}`);
+}
+
+export async function getAuditItemsByRunId(runId: string): Promise<DocAuditItem[]> {
+  const { data, error } = await getCrispSupabase()
+    .from("tchat_doc_audit_items")
+    .select("*")
+    .eq("audit_run_id", runId)
+    .eq("status", "done")
+    .order("created_at", { ascending: true });
+
+  if (error) throw new Error(`getAuditItemsByRunId: ${error.message}`);
+  return data || [];
+}
+
+export async function insertFaqDocumentWithType(
+  markdown: string,
+  modelUsed: string,
+  stats: Record<string, unknown>,
+  docMetadata: Record<string, unknown>,
+  type: string
+): Promise<number> {
+  const sb = getCrispSupabase();
+
+  const { data: maxRow } = await sb
+    .from("tchat_faq_documents")
+    .select("version")
+    .eq("type", type)
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const nextVersion = (maxRow?.version ?? 0) + 1;
+
+  const { error } = await sb
+    .from("tchat_faq_documents")
+    .insert({
+      version: nextVersion,
+      generated_at: new Date().toISOString(),
+      model_used: modelUsed,
+      markdown,
+      stats,
+      metadata: docMetadata,
+      type,
+    });
+
+  if (error) throw new Error(`insertFaqDocumentWithType: ${error.message}`);
+  return nextVersion;
+}
+
+// ============================================
+// Circle posts fetch (for audit)
+// ============================================
+
+export interface CirclePostForAudit {
+  id: number;
+  name: string;
+  url: string;
+  space_slug: string;
+  space_name: string;
+  body_html: string;
+  body_plain_text: string | null;
+  comments: unknown[] | null;
+  comments_count: number;
+  published_at: string;
+}
+
+export async function getAllCirclePosts(): Promise<CirclePostForAudit[]> {
+  const sb = getCrispSupabase();
+  const { data, error } = await sb
+    .from("circle_posts")
+    .select("id, name, url, space_slug, space_name, body_html, body_plain_text, comments, comments_count, published_at")
+    .eq("status", "published")
+    .order("published_at", { ascending: false });
+
+  if (error) throw new Error(`getAllCirclePosts: ${error.message}`);
+  return (data || []) as CirclePostForAudit[];
+}
+
+// ============================================
 // Stats
 // ============================================
 
