@@ -88,7 +88,7 @@ IMPORTANT :
 
 export const generateFaqDocument = task({
   id: "generate-faq-document",
-  maxDuration: 600,
+  maxDuration: 1800, // 30 min — multiple Opus streaming calls
   run: async (payload: { minScore?: number; dryRun?: boolean }) => {
     const startTime = Date.now();
     const minScore = payload.minScore ?? DEFAULT_MIN_SCORE;
