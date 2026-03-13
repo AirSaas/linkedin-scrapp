@@ -32,7 +32,7 @@ interface Payload {
 // ============================================
 export const forceEnrichCleanContactsCrm = task({
   id: "force-enrich-clean-contacts-crm",
-  maxDuration: 14400, // 4h — ~16k contacts at 600ms each
+  maxDuration: 43200, // 12h — ~11k contacts at ~3.5s each (enrich ~2-3s + 600ms sleep)
   run: async (payload: Payload) => {
     const maxContacts = payload.maxContacts ?? DEFAULTS.maxContacts;
     const delayMs = payload.delayMs ?? DEFAULTS.delayMs;
