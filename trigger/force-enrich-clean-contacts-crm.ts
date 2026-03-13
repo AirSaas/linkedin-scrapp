@@ -51,9 +51,10 @@ export const forceEnrichCleanContactsCrm = task({
     // ------------------------------------------
     // 1. Fetch all PRC_CONTACTS LinkedIn URLs
     // ------------------------------------------
-    logger.info("Fetching PRC_CONTACTS LinkedIn URLs...");
+    logger.info("Step 1: Fetching PRC_CONTACTS LinkedIn URLs...");
     const prcUrls: string[] = [];
     let offset = 0;
+    let prcPages = 0;
 
     while (true) {
       const { data, error } = await supabase
@@ -63,11 +64,17 @@ export const forceEnrichCleanContactsCrm = task({
         .neq("CONTACT_LINKEDIN_PROFILE_URL", "")
         .range(offset, offset + SUPABASE_PAGE_SIZE - 1);
 
+      prcPages++;
       if (error) {
-        logger.error("PRC_CONTACTS fetch error", { error: error.message, offset });
+        logger.error("PRC_CONTACTS fetch error", { error: error.message, offset, page: prcPages });
         break;
       }
-      if (!data || data.length === 0) break;
+      if (!data || data.length === 0) {
+        logger.info(`PRC_CONTACTS: page ${prcPages} empty, done fetching`);
+        break;
+      }
+
+      logger.info(`PRC_CONTACTS: page ${prcPages} → ${data.length} rows (total so far: ${prcUrls.length + data.length})`);
 
       for (const row of data) {
         const url = row.CONTACT_LINKEDIN_PROFILE_URL as string;
@@ -78,14 +85,15 @@ export const forceEnrichCleanContactsCrm = task({
       offset += SUPABASE_PAGE_SIZE;
     }
 
-    logger.info(`PRC_CONTACTS with LinkedIn: ${prcUrls.length}`);
+    logger.info(`Step 1 done: ${prcUrls.length} PRC_CONTACTS with LinkedIn URL (${prcPages} pages)`);
 
     // ------------------------------------------
     // 2. Fetch enriched_contacts cache (url → last_updated_at)
     // ------------------------------------------
-    logger.info("Fetching enriched_contacts cache...");
+    logger.info("Step 2: Fetching enriched_contacts cache...");
     const enrichedCache = new Map<string, string>();
     offset = 0;
+    let cachePages = 0;
 
     while (true) {
       const { data, error } = await supabase
@@ -93,11 +101,19 @@ export const forceEnrichCleanContactsCrm = task({
         .select("linkedin_profile_url, last_updated_at")
         .range(offset, offset + SUPABASE_PAGE_SIZE - 1);
 
+      cachePages++;
       if (error) {
-        logger.error("enriched_contacts fetch error", { error: error.message, offset });
+        logger.error("enriched_contacts fetch error", { error: error.message, offset, page: cachePages });
         break;
       }
-      if (!data || data.length === 0) break;
+      if (!data || data.length === 0) {
+        logger.info(`enriched_contacts: page ${cachePages} empty, done fetching`);
+        break;
+      }
+
+      if (cachePages % 20 === 0) {
+        logger.info(`enriched_contacts: page ${cachePages} → ${enrichedCache.size + data.length} entries so far`);
+      }
 
       for (const row of data) {
         const url = row.linkedin_profile_url as string;
@@ -109,13 +125,16 @@ export const forceEnrichCleanContactsCrm = task({
       offset += SUPABASE_PAGE_SIZE;
     }
 
-    logger.info(`enriched_contacts cache loaded: ${enrichedCache.size} entries`);
+    logger.info(`Step 2 done: ${enrichedCache.size} enriched_contacts cached (${cachePages} pages)`);
 
     // ------------------------------------------
     // 3. Filter: keep contacts not in cache or stale
     // ------------------------------------------
+    logger.info("Step 3: Filtering contacts...");
     const toEnrich: string[] = [];
     let skippedRecent = 0;
+    let notInCache = 0;
+    let staleInCache = 0;
 
     for (const url of prcUrls) {
       const cachedDate = enrichedCache.get(url);
@@ -123,13 +142,19 @@ export const forceEnrichCleanContactsCrm = task({
         skippedRecent++;
         continue;
       }
+      if (!cachedDate) notInCache++;
+      else staleInCache++;
       toEnrich.push(url);
       if (toEnrich.length >= maxContacts) break;
     }
 
-    logger.info(
-      `Filtered: ${toEnrich.length} to enrich, ${skippedRecent} skipped (recent)`
-    );
+    logger.info(`Step 3 done — Filtering results`, {
+      toEnrich: toEnrich.length,
+      skippedRecent,
+      notInCache,
+      staleInCache,
+      sample: toEnrich.slice(0, 5),
+    });
 
     if (toEnrich.length === 0) {
       logger.info("Nothing to enrich, exiting");
@@ -148,25 +173,34 @@ export const forceEnrichCleanContactsCrm = task({
     // ------------------------------------------
     // 4. Enrich loop
     // ------------------------------------------
+    logger.info(`Step 4: Starting enrich loop — ${toEnrich.length} contacts, delay=${delayMs}ms`);
     let success = 0;
     let failed = 0;
 
     for (let i = 0; i < toEnrich.length; i++) {
       const url = toEnrich[i];
 
-      if (i > 0 && i % 500 === 0) {
-        logger.info(`Progress: ${i}/${toEnrich.length} (${success} ok, ${failed} err)`);
-      }
+      // Log first 10, then every 100, then every 500
+      const shouldLog = i < 10 || (i < 100 && i % 10 === 0) || i % 100 === 0;
 
       if (dryRun) {
-        logger.info(`[DRY RUN] Would enrich: ${url}`);
+        if (shouldLog) logger.info(`[DRY RUN] [${i + 1}/${toEnrich.length}] Would enrich: ${url}`);
         success++;
         continue;
       }
 
       try {
-        await callEnrichWithRetry(url);
+        const enrichResult = await callEnrichWithRetry(url);
         success++;
+
+        if (shouldLog) {
+          logger.info(`[${i + 1}/${toEnrich.length}] OK: ${url}`, {
+            name: enrichResult?.data?.full_name ?? "?",
+            company: enrichResult?.data?.company_name ?? "?",
+            role: enrichResult?.data?.job_strategic_role ?? null,
+            privateId: enrichResult?.data?.linkedin_private_id ? "yes" : "NO",
+          });
+        }
       } catch (err) {
         failed++;
         const msg = err instanceof Error ? err.message : String(err);
@@ -176,17 +210,20 @@ export const forceEnrichCleanContactsCrm = task({
           message: `${url} — ${msg}`,
           profile: url,
         });
-        if (failed <= 5) {
-          logger.warn(`Enrich failed: ${url}`, { error: msg });
+        // Log all errors for first 20, then cap
+        if (failed <= 20) {
+          logger.warn(`[${i + 1}/${toEnrich.length}] FAIL: ${url}`, { error: msg });
+        }
+        if (failed === 20) {
+          logger.warn("Capping error logs at 20, further errors only tracked in summary");
         }
       }
 
       await sleep(delayMs);
     }
 
-    logger.info(
-      `Done: ${success} success, ${failed} failed out of ${toEnrich.length}`
-    );
+    const elapsedMin = Math.round((Date.now() - startTime) / 60_000);
+    logger.info(`Step 4 done: ${success} success, ${failed} failed out of ${toEnrich.length} (${elapsedMin} min elapsed)`);
 
     // ------------------------------------------
     // 5. Reports
@@ -217,7 +254,7 @@ export const forceEnrichCleanContactsCrm = task({
 // ============================================
 // ENRICH WITH 1 RETRY
 // ============================================
-async function callEnrichWithRetry(linkedinUrl: string): Promise<void> {
+async function callEnrichWithRetry(linkedinUrl: string): Promise<any> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const res = await fetch(ENRICH_URL, {
       method: "POST",
@@ -232,16 +269,27 @@ async function callEnrichWithRetry(linkedinUrl: string): Promise<void> {
       }),
     });
 
-    if (res.ok) return;
+    if (res.ok) {
+      const json = await res.json();
+      if (!json?.data?.linkedin_private_id) {
+        logger.warn(`Enrich OK but missing linkedin_private_id for ${linkedinUrl}`, {
+          keys: json?.data ? Object.keys(json.data).slice(0, 10) : "no data",
+        });
+      }
+      return json;
+    }
 
     const text = await res.text();
     if (attempt === 0) {
-      logger.warn(`Enrich attempt 1 failed (${res.status}), retrying in 2s...`);
+      logger.warn(`Enrich attempt 1 failed for ${linkedinUrl}`, {
+        status: res.status,
+        body: text.substring(0, 300),
+      });
       await sleep(RETRY_DELAY_MS);
       continue;
     }
 
-    throw new Error(`${res.status} — ${text.substring(0, 200)}`);
+    throw new Error(`HTTP ${res.status} — ${text.substring(0, 300)}`);
   }
 }
 
