@@ -17,6 +17,7 @@ const HUBSPOT_CONTACT_BASE_URL =
   "https://app.hubspot.com/contacts/7979190/record/0-1";
 const BERTRAN_HUBSPOT_OWNER_ID = "48901672";
 const SLACK_CHANNEL_LOGERROR_ID = "C0AAXKPRKT8";
+const MIN_EMPLOYEES_FOR_HUBSPOT = 500;
 
 const EXCLUDED_LINKEDIN_PROFILES = [
   "https://www.linkedin.com/in/stephan-boisson-3ba61950/",
@@ -110,6 +111,8 @@ interface IntentEvent {
   CONNECTED_WITH_INTENT_OWNER?: boolean;
   EVENT_RECORD_ORIGIN?: string;
   CONTACT_JOB_STRATEGIC_ROLE?: string;
+  COMPANY_APPROX_EMPLOYEE_NB?: number | string | null;
+  COMPANY_SIZE_RANGE?: string | null;
 }
 
 interface ConcurrentContact {
@@ -781,6 +784,28 @@ function isExcludedProfile(linkedinUrl: string | undefined | null): boolean {
   });
 }
 
+function isCompanyLargeEnough(record: IntentEvent): boolean {
+  // Priority 1: exact employee count
+  const approx = record.COMPANY_APPROX_EMPLOYEE_NB;
+  if (approx !== null && approx !== undefined) {
+    const num = typeof approx === "number" ? approx : parseInt(String(approx), 10);
+    if (!isNaN(num)) return num >= MIN_EMPLOYEES_FOR_HUBSPOT;
+  }
+
+  // Priority 2: size range lower bound from "[X-Y]" or "[X,Y]"
+  const range = record.COMPANY_SIZE_RANGE;
+  if (range && typeof range === "string") {
+    const match = range.match(/\[(\d+)[,\-]/);
+    if (match) {
+      const lowerBound = parseInt(match[1], 10);
+      if (!isNaN(lowerBound)) return lowerBound >= MIN_EMPLOYEES_FOR_HUBSPOT;
+    }
+  }
+
+  // Both null/unparseable → conservateur → skip
+  return false;
+}
+
 function normalizeOwner(owner: string | undefined | null): string {
   if (!owner) return "unknown";
   return owner
@@ -967,6 +992,19 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
     }
 
     if (action === "HUBSPOT") {
+      // Filter: skip small companies for HubSpot routing
+      if (!isCompanyLargeEnough(record)) {
+        const sizeInfo = record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "unknown";
+        logger.info(`HubSpot skip - Company too small (${sizeInfo}) for ${fullName}`);
+        logRoutingDecision({ ...logBase, destination: "SKIPPED", skip_reason: "company_too_small" });
+        hubspotSkipped++;
+        shouldSendSlack = false;
+        processedEvents.push({ record, action, shouldSendSlack });
+        processed++;
+        await sleep(RATE_LIMIT.PAUSE_BETWEEN_EVENTS);
+        continue;
+      }
+
       // Connected with intent owner → HubSpot routing based on BUSINESS_OWNER
       const contactHubspotId = record.CONTACT_HUBSPOT_ID;
 
