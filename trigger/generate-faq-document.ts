@@ -7,93 +7,31 @@ import { getAllFaqExtractions, insertFaqDocument, type FaqEntry } from "./lib/cr
 // CONFIGURATION
 // ============================================
 
-const MODEL = "claude-sonnet-4-20250514";
+const MODEL = "claude-opus-4-20250514";
 const MAX_TOKENS_PER_THEME = 8000;
 const TEMPERATURE = 0.3;
 const DEFAULT_MIN_SCORE = 3;
+const MAX_CANONICAL_THEMES = 30;
 
 // ============================================
-// THEME NORMALIZATION MAP
+// THEME CONSOLIDATION PROMPT (Opus — Step 0)
 // ============================================
 
-// Programmatic grouping: map raw themes to canonical themes
-// This avoids expensive AI calls for theme consolidation
-const THEME_ALIASES: Record<string, string> = {
-  // Utilisateurs & licences
-  "gestion des utilisateurs": "Gestion des utilisateurs et licences",
-  "gestion des utilisateurs et licences": "Gestion des utilisateurs et licences",
-  "gestion des comptes utilisateurs": "Gestion des utilisateurs et licences",
-  "gestion des licences": "Gestion des utilisateurs et licences",
-  "utilisateurs et droits": "Gestion des utilisateurs et licences",
-  "comptes utilisateurs": "Gestion des utilisateurs et licences",
-  // Droits & permissions
-  "droits et permissions": "Droits et permissions",
-  "permissions et rôles": "Droits et permissions",
-  "gestion des droits et permissions": "Droits et permissions",
-  "partage et permissions": "Droits et permissions",
-  "rôles et permissions": "Droits et permissions",
-  // Vues & filtres
-  "filtrage et vues": "Vues et filtres",
-  "vues et filtres": "Vues et filtres",
-  "affichage et vues": "Vues et filtres",
-  "navigation et vues": "Vues et filtres",
-  "gestion des vues": "Vues et filtres",
-  "vues et filtres portfolio": "Vues et filtres",
-  "affichage des données dans les vues": "Vues et filtres",
-  "smart views": "Vues et filtres",
-  "vues intelligentes": "Vues et filtres",
-  "filtres et smart views": "Vues et filtres",
-  // Quarter planning
-  "quarter plan": "Quarter Plan",
-  "quarter planning": "Quarter Plan",
-  "planification trimestrielle": "Quarter Plan",
-  // IA
-  "fonctionnalités ia": "Intelligence Artificielle",
-  "intelligence artificielle": "Intelligence Artificielle",
-  "ia et automatisation": "Intelligence Artificielle",
-  // Configuration
-  "configuration et personnalisation": "Configuration et personnalisation",
-  "configuration et paramétrage": "Configuration et personnalisation",
-  "personnalisation et configuration": "Configuration et personnalisation",
-  "paramétrage": "Configuration et personnalisation",
-  // Intégrations
-  "intégrations": "Intégrations",
-  "intégrations externes": "Intégrations",
-  "intégrations tierces": "Intégrations",
-  // Budget
-  "gestion budgétaire": "Budget et coûts",
-  "budget": "Budget et coûts",
-  "budgets et coûts": "Budget et coûts",
-  // Équipes
-  "gestion des équipes": "Gestion des équipes",
-  "organisation des équipes": "Gestion des équipes",
-  // Authentification
-  "authentification et accès": "Authentification et sécurité",
-  "authentification et sécurité": "Authentification et sécurité",
-  // Partage
-  "partage et collaboration": "Partage et collaboration",
-  "flash reports et partage": "Partage et collaboration",
-  // Export
-  "export et présentation": "Export et données",
-  "export et analyse de données": "Export et données",
-  "import de données": "Export et données",
-  // Capacité
-  "capacité et planification": "Capacité et ressources",
-  "capacité et ressources": "Capacité et ressources",
-  // Notifications
-  "notifications et communication": "Notifications",
-  "notifications": "Notifications",
-  // Navigation
-  "navigation et interface": "Navigation et interface",
-  // Modules
-  "modules et fonctionnalités": "Activation de fonctionnalités",
-  "activation de fonctionnalités": "Activation de fonctionnalités",
-};
+const THEME_CONSOLIDATION_PROMPT = `Tu es un expert en taxonomie produit pour AirSaas / PRC (SaaS B2B de gestion de projets).
 
-function normalizeTheme(rawTheme: string): string {
-  const key = rawTheme.toLowerCase().trim();
-  return THEME_ALIASES[key] || rawTheme; // Keep original if no alias
-}
+Tu reçois une liste de thèmes bruts extraits de conversations support, avec le nombre d'entrées par thème.
+
+Ta mission : regrouper ces thèmes en MAXIMUM ${MAX_CANONICAL_THEMES} thèmes canoniques.
+
+RÈGLES :
+- Fusionne les variantes orthographiques, les inversions (ex: "Gestion des licences et utilisateurs" = "Gestion des utilisateurs et licences"), le snake_case, les sous-thèmes trop spécifiques
+- Chaque thème canonique doit être clair, en français, capitalisé proprement
+- Couvre l'ensemble des sujets sans perte — chaque thème brut doit être mappé
+- Privilégie des noms de thème courts et génériques (ex: "Vues et filtres" plutôt que "Personnalisation et filtrage des vues portfolio")
+- Un thème "Autre" est interdit — tout doit avoir un vrai thème
+
+Réponds UNIQUEMENT avec un JSON valide : un objet où chaque clé est un thème brut (exactement comme fourni) et la valeur est le thème canonique.
+Pas de markdown, pas de commentaire, juste le JSON.`;
 
 // ============================================
 // PROMPT (per theme group — dedup + markdown)
@@ -150,10 +88,38 @@ export const generateFaqDocument = task({
         return { skipped: true, reason: "no_entries" };
       }
 
-      // 2. Group by normalized theme (programmatic — no AI needed)
+      // 2. Step 0 — Opus consolidates raw themes into ≤30 canonical themes
+      const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+      // Collect raw themes with counts
+      const rawThemeCounts = new Map<string, number>();
+      for (const entry of allEntries) {
+        const raw = entry.theme || "Autre";
+        rawThemeCounts.set(raw, (rawThemeCounts.get(raw) || 0) + 1);
+      }
+      logger.info(`Found ${rawThemeCounts.size} raw themes from ${allEntries.length} entries`);
+
+      // Call Opus for theme consolidation
+      const themeListForOpus = [...rawThemeCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([theme, count]) => `${theme} (${count})`)
+        .join("\n");
+
+      logger.info(`Calling Opus to consolidate ${rawThemeCounts.size} themes into ≤${MAX_CANONICAL_THEMES}...`);
+      const consolidationResult = await callClaudeForThemeConsolidation(
+        client,
+        THEME_CONSOLIDATION_PROMPT,
+        `Voici ${rawThemeCounts.size} thèmes bruts (avec nombre d'entrées) :\n\n${themeListForOpus}`,
+      );
+
+      // consolidationResult is Record<string, string> mapping raw → canonical
+      logger.info(`Opus consolidated into ${new Set(Object.values(consolidationResult)).size} canonical themes`);
+
+      // Group entries by canonical theme
       const themeGroups = new Map<string, FaqEntry[]>();
       for (const entry of allEntries) {
-        const canonical = normalizeTheme(entry.theme || "Autre");
+        const raw = entry.theme || "Autre";
+        const canonical = consolidationResult[raw] || raw;
         const group = themeGroups.get(canonical) || [];
         group.push(entry);
         themeGroups.set(canonical, group);
@@ -169,12 +135,13 @@ export const generateFaqDocument = task({
       }
 
       if (dryRun) {
-        logger.info("Dry run — skipping Claude calls and save");
+        logger.info("Dry run — skipping Sonnet calls and save");
         return {
           dryRun: true,
           entriesTotal: allEntries.length,
           themeCount: sortedThemes.length,
           themes: sortedThemes.map(([t, e]) => ({ theme: t, count: e.length })),
+          consolidationMapping: consolidationResult,
         };
       }
 
@@ -182,7 +149,6 @@ export const generateFaqDocument = task({
       // Themes with <=2 entries: format directly in code (no AI needed)
       // Themes with 3+ entries: one Sonnet call for dedup + markdown
       const AI_THRESHOLD = 3; // Only call Claude for themes with 3+ entries
-      const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
       const sections: Array<{ theme: string; markdown: string; entryCount: number }> = [];
       let totalEntriesAfterDedup = 0;
       let aiCallCount = 0;
@@ -217,7 +183,7 @@ Légende JSON : t=titre, a=réponse, n=besoin sous-jacent, s=score, sq=citations
 
 ${JSON.stringify(compact)}`;
 
-        const sectionMd = await callClaudeText(client, THEME_SYSTEM_PROMPT, userPrompt, MAX_TOKENS_PER_THEME);
+        const sectionMd = await callClaudeText(client, MODEL, THEME_SYSTEM_PROMPT, userPrompt, MAX_TOKENS_PER_THEME);
 
         if (sectionMd) {
           const questionCount = (sectionMd.match(/^### /gm) || []).length;
@@ -353,15 +319,53 @@ function formatEntriesDirectly(entries: FaqEntry[]): string {
   return lines.join("\n");
 }
 
+async function callClaudeForThemeConsolidation(
+  client: Anthropic,
+  systemPrompt: string,
+  userPrompt: string,
+): Promise<Record<string, string>> {
+  const callOnce = async () => {
+    const stream = client.messages.stream({
+      model: MODEL,
+      max_tokens: 16000,
+      temperature: 0.1,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userPrompt }],
+    });
+
+    const message = await stream.finalMessage();
+    const textBlock = message.content.find((b) => b.type === "text");
+    if (!textBlock || textBlock.type !== "text") throw new Error("No text in Opus response");
+
+    // Extract JSON from response (may be wrapped in ```json ... ```)
+    let jsonStr = textBlock.text.trim();
+    const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) jsonStr = jsonMatch[1].trim();
+
+    return JSON.parse(jsonStr) as Record<string, string>;
+  };
+
+  try {
+    return await callOnce();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`Opus theme consolidation failed, retrying in 5s: ${msg}`);
+    await new Promise((r) => setTimeout(r, 5000));
+    // No fallback — if retry fails, task fails with alert
+    return await callOnce();
+  }
+}
+
 async function callClaudeText(
   client: Anthropic,
+  model: string,
   systemPrompt: string,
   userPrompt: string,
   maxTokens: number
 ): Promise<string | null> {
   const callOnce = async () => {
     const stream = client.messages.stream({
-      model: MODEL,
+      model,
       max_tokens: maxTokens,
       temperature: TEMPERATURE,
       system: systemPrompt,
