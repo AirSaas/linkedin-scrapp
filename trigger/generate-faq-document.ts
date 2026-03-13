@@ -7,7 +7,8 @@ import { getAllFaqExtractions, insertFaqDocument, type FaqEntry } from "./lib/cr
 // CONFIGURATION
 // ============================================
 
-const MODEL = "claude-opus-4-20250514";
+const MODEL_PHASE1 = "claude-sonnet-4-20250514"; // Fast dedup
+const MODEL_PHASE2 = "claude-opus-4-20250514"; // Quality markdown
 const MAX_TOKENS_PHASE1 = 16000;
 const MAX_TOKENS_PHASE2 = 32000;
 const TEMPERATURE = 0.3;
@@ -135,6 +136,7 @@ export const generateFaqDocument = task({
 
         const result = await callClaudeJson(
           client,
+          MODEL_PHASE1,
           PHASE1_SYSTEM_PROMPT,
           `Voici ${batch.length} entrées FAQ à consolider :\n\n${JSON.stringify(stripped, null, 2)}`,
           MAX_TOKENS_PHASE1
@@ -180,7 +182,7 @@ Nombre après déduplication : ${consolidatedAll.length}
 Entrées :
 ${JSON.stringify(consolidatedAll, null, 2)}`;
 
-      const markdown = await callClaudeText(client, PHASE2_SYSTEM_PROMPT, phase2Prompt, MAX_TOKENS_PHASE2);
+      const markdown = await callClaudeText(client, MODEL_PHASE2, PHASE2_SYSTEM_PROMPT, phase2Prompt, MAX_TOKENS_PHASE2);
 
       if (!markdown) {
         logger.error("Phase 2 failed — no markdown generated");
@@ -211,7 +213,7 @@ ${JSON.stringify(consolidatedAll, null, 2)}`;
         generation_duration_ms: Date.now() - startTime,
       };
 
-      const version = await insertFaqDocument(markdown, MODEL, stats, docMetadata);
+      const version = await insertFaqDocument(markdown, `${MODEL_PHASE1} + ${MODEL_PHASE2}`, stats, docMetadata);
       logger.info(`Saved FAQ document v${version} to Supabase`);
 
       // 7. Slack notification
@@ -259,13 +261,14 @@ ${JSON.stringify(consolidatedAll, null, 2)}`;
 
 async function callClaudeJson(
   client: Anthropic,
+  model: string,
   systemPrompt: string,
   userPrompt: string,
   maxTokens: number
 ): Promise<unknown[] | null> {
   const callOnce = async () => {
     const stream = client.messages.stream({
-      model: MODEL,
+      model,
       max_tokens: maxTokens,
       temperature: TEMPERATURE,
       system: systemPrompt,
@@ -309,13 +312,14 @@ async function callClaudeJson(
 
 async function callClaudeText(
   client: Anthropic,
+  model: string,
   systemPrompt: string,
   userPrompt: string,
   maxTokens: number
 ): Promise<string | null> {
   const callOnce = async () => {
     const stream = client.messages.stream({
-      model: MODEL,
+      model,
       max_tokens: maxTokens,
       temperature: TEMPERATURE,
       system: systemPrompt,
