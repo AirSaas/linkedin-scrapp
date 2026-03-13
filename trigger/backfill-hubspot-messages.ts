@@ -8,6 +8,7 @@ import { sendMessageToHubSpot } from "./lib/hubspot.js";
 // ============================================
 // Sends LinkedIn messages missing hubspot_communication_id to HubSpot.
 // Processes BATCH_SIZE messages per run, then self-triggers if more remain.
+// Stops when no progress is made (all remaining messages are untreatable).
 // Trigger manually from dashboard — no cron.
 // ============================================
 
@@ -100,21 +101,24 @@ export const backfillHubspotMessagesTask = task({
       errors: errorDetails,
     }]);
 
+    const noProgress = totalSent === 0;
     const summary = {
       success: true,
       totalProcessed: messages.length,
       totalSent,
       totalSkipped,
       errors: errorDetails.length,
-      done: messages.length < BATCH_SIZE,
+      done: messages.length < BATCH_SIZE || noProgress,
     };
 
     logger.info("=== SUMMARY ===", summary);
 
-    // 5. Self-trigger next batch if more messages remain
-    if (messages.length >= BATCH_SIZE) {
+    // 5. Self-trigger next batch if more messages remain AND we made progress
+    if (messages.length >= BATCH_SIZE && !noProgress) {
       logger.info("More messages remain — triggering next batch...");
       await backfillHubspotMessagesTask.trigger();
+    } else if (noProgress) {
+      logger.info("No messages were sent this batch — stopping to avoid infinite loop.");
     } else {
       logger.info("Backfill complete — no more messages to process.");
     }
