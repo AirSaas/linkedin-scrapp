@@ -12,7 +12,7 @@ const SONNET_MODEL = "claude-sonnet-4-20250514";
 const MAX_TOKENS_PER_THEME = 8000;
 const TEMPERATURE = 0.3;
 const DEFAULT_MIN_SCORE = 3;
-const MAX_CANONICAL_THEMES = 30;
+const MAX_CANONICAL_THEMES = 25;
 
 // ============================================
 // THEME CONSOLIDATION PROMPT (Opus — Step 0)
@@ -24,8 +24,17 @@ Tu reçois une liste de thèmes bruts extraits de conversations support, avec le
 
 Ta mission : regrouper ces thèmes en MAXIMUM ${MAX_CANONICAL_THEMES} thèmes canoniques.
 
+⚠️ C'est une CONTRAINTE ABSOLUE, pas une suggestion. Si ton JSON produit plus de ${MAX_CANONICAL_THEMES} valeurs distinctes, ta réponse sera rejetée. Compte tes thèmes canoniques avant de répondre.
+
 RÈGLES :
-- Fusionne les variantes orthographiques, les inversions (ex: "Gestion des licences et utilisateurs" = "Gestion des utilisateurs et licences"), le snake_case, les sous-thèmes trop spécifiques
+- Fusionne AGRESSIVEMENT : variantes orthographiques, inversions, snake_case, sous-thèmes trop spécifiques
+- Exemples de fusions attendues :
+  • "Vues et filtres", "Filtrage et recherche", "Smart Views", "Personnalisation des vues", "Affichage et filtrage" → un seul thème "Vues et filtres"
+  • "Quarter Plan", "Quarter Planning et coordination", "Gestion des quarters", "Capacity Planning", "Capacité et ressources" → un seul thème "Quarter Plan et capacité"
+  • "Gestion des jalons", "Dépendances jalons", "Jalons et météo", "Estimation des jalons" → un seul thème "Jalons et dépendances"
+  • "Export et données", "Export et partage", "Import de données", "Export et reporting" → un seul thème "Export et import"
+  • "Droits et permissions", "Gestion des rôles", "Permissions et visibilité", "Confidentialité" → un seul thème "Droits et permissions"
+  • "Notifications", "Notifications et alertes", "Communication et notifications" → un seul thème "Notifications"
 - Chaque thème canonique doit être clair, en français, capitalisé proprement
 - Couvre l'ensemble des sujets sans perte — chaque thème brut doit être mappé
 - Privilégie des noms de thème courts et génériques (ex: "Vues et filtres" plutôt que "Personnalisation et filtrage des vues portfolio")
@@ -70,7 +79,7 @@ RÈGLES :
 
 export const generateFaqDocument = task({
   id: "generate-faq-document",
-  maxDuration: 1800, // 30 min
+  maxDuration: 2400, // 40 min
   run: async (payload: { minScore?: number; dryRun?: boolean }) => {
     const startTime = Date.now();
     const minScore = payload.minScore ?? DEFAULT_MIN_SCORE;
@@ -114,7 +123,11 @@ export const generateFaqDocument = task({
       );
 
       // consolidationResult is Record<string, string> mapping raw → canonical
-      logger.info(`Opus consolidated into ${new Set(Object.values(consolidationResult)).size} canonical themes`);
+      const canonicalCount = new Set(Object.values(consolidationResult)).size;
+      logger.info(`Opus consolidated into ${canonicalCount} canonical themes`);
+      if (canonicalCount > MAX_CANONICAL_THEMES) {
+        logger.warn(`⚠️ Opus returned ${canonicalCount} themes, exceeding limit of ${MAX_CANONICAL_THEMES}`);
+      }
 
       // Group entries by canonical theme
       const themeGroups = new Map<string, FaqEntry[]>();
