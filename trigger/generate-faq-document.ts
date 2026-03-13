@@ -8,7 +8,7 @@ import { getAllFaqExtractions, insertFaqDocument, type FaqEntry } from "./lib/cr
 // ============================================
 
 const MODEL_PHASE1 = "claude-sonnet-4-20250514"; // Fast dedup
-const MODEL_PHASE2 = "claude-opus-4-20250514"; // Quality markdown
+const MODEL_PHASE2 = "claude-sonnet-4-20250514"; // Fast markdown (Opus times out)
 const MAX_TOKENS_PHASE1 = 16000;
 const MAX_TOKENS_PHASE2 = 32000;
 const TEMPERATURE = 0.3;
