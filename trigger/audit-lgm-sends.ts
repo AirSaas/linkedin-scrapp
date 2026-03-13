@@ -23,6 +23,7 @@ const HUBSPOT_DESTINATIONS = new Set([
 // ============================================
 export const auditLgmSendsTask = schedules.task({
   id: "audit-lgm-sends",
+  cron: "0 8 * * 1",
   maxDuration: 300,
   run: async () => {
     logger.info("=== START audit-lgm-sends ===");
