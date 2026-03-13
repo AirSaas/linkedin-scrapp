@@ -7,81 +7,123 @@ import { getAllFaqExtractions, insertFaqDocument, type FaqEntry } from "./lib/cr
 // CONFIGURATION
 // ============================================
 
-const MODEL_PHASE1 = "claude-sonnet-4-20250514"; // Fast dedup
-const MODEL_PHASE2 = "claude-sonnet-4-20250514"; // Fast markdown (Opus times out)
-const MAX_TOKENS_PHASE1 = 16000;
-const MAX_TOKENS_PHASE2 = 32000;
+const MODEL = "claude-sonnet-4-20250514";
+const MAX_TOKENS_PER_THEME = 8000;
 const TEMPERATURE = 0.3;
-const BATCH_SIZE = 100;
 const DEFAULT_MIN_SCORE = 3;
 
 // ============================================
-// PROMPTS
+// THEME NORMALIZATION MAP
 // ============================================
 
-const PHASE1_SYSTEM_PROMPT = `Tu es un expert en consolidation de FAQ produit SaaS B2B (AirSaas / PRC).
+// Programmatic grouping: map raw themes to canonical themes
+// This avoids expensive AI calls for theme consolidation
+const THEME_ALIASES: Record<string, string> = {
+  // Utilisateurs & licences
+  "gestion des utilisateurs": "Gestion des utilisateurs et licences",
+  "gestion des utilisateurs et licences": "Gestion des utilisateurs et licences",
+  "gestion des comptes utilisateurs": "Gestion des utilisateurs et licences",
+  "gestion des licences": "Gestion des utilisateurs et licences",
+  "utilisateurs et droits": "Gestion des utilisateurs et licences",
+  "comptes utilisateurs": "Gestion des utilisateurs et licences",
+  // Droits & permissions
+  "droits et permissions": "Droits et permissions",
+  "permissions et rôles": "Droits et permissions",
+  "gestion des droits et permissions": "Droits et permissions",
+  "partage et permissions": "Droits et permissions",
+  "rôles et permissions": "Droits et permissions",
+  // Vues & filtres
+  "filtrage et vues": "Vues et filtres",
+  "vues et filtres": "Vues et filtres",
+  "affichage et vues": "Vues et filtres",
+  "navigation et vues": "Vues et filtres",
+  "gestion des vues": "Vues et filtres",
+  "vues et filtres portfolio": "Vues et filtres",
+  "affichage des données dans les vues": "Vues et filtres",
+  "smart views": "Vues et filtres",
+  "vues intelligentes": "Vues et filtres",
+  "filtres et smart views": "Vues et filtres",
+  // Quarter planning
+  "quarter plan": "Quarter Plan",
+  "quarter planning": "Quarter Plan",
+  "planification trimestrielle": "Quarter Plan",
+  // IA
+  "fonctionnalités ia": "Intelligence Artificielle",
+  "intelligence artificielle": "Intelligence Artificielle",
+  "ia et automatisation": "Intelligence Artificielle",
+  // Configuration
+  "configuration et personnalisation": "Configuration et personnalisation",
+  "configuration et paramétrage": "Configuration et personnalisation",
+  "personnalisation et configuration": "Configuration et personnalisation",
+  "paramétrage": "Configuration et personnalisation",
+  // Intégrations
+  "intégrations": "Intégrations",
+  "intégrations externes": "Intégrations",
+  "intégrations tierces": "Intégrations",
+  // Budget
+  "gestion budgétaire": "Budget et coûts",
+  "budget": "Budget et coûts",
+  "budgets et coûts": "Budget et coûts",
+  // Équipes
+  "gestion des équipes": "Gestion des équipes",
+  "organisation des équipes": "Gestion des équipes",
+  // Authentification
+  "authentification et accès": "Authentification et sécurité",
+  "authentification et sécurité": "Authentification et sécurité",
+  // Partage
+  "partage et collaboration": "Partage et collaboration",
+  "flash reports et partage": "Partage et collaboration",
+  // Export
+  "export et présentation": "Export et données",
+  "export et analyse de données": "Export et données",
+  "import de données": "Export et données",
+  // Capacité
+  "capacité et planification": "Capacité et ressources",
+  "capacité et ressources": "Capacité et ressources",
+  // Notifications
+  "notifications et communication": "Notifications",
+  "notifications": "Notifications",
+  // Navigation
+  "navigation et interface": "Navigation et interface",
+  // Modules
+  "modules et fonctionnalités": "Activation de fonctionnalités",
+  "activation de fonctionnalités": "Activation de fonctionnalités",
+};
 
-Tu reçois un batch d'entrées FAQ extraites de conversations support Crisp. Chaque entrée a un thème, une question, une réponse suggérée, des citations source et des références Circle.
+function normalizeTheme(rawTheme: string): string {
+  const key = rawTheme.toLowerCase().trim();
+  return THEME_ALIASES[key] || rawTheme; // Keep original if no alias
+}
 
-Ta mission en 3 étapes :
+// ============================================
+// PROMPT (per theme group — dedup + markdown)
+// ============================================
 
-1. NORMALISER LES THÈMES — Beaucoup de thèmes sont des variantes du même sujet :
-   - "Gestion des utilisateurs" + "Gestion des utilisateurs et licences" + "Utilisateurs et droits" → un seul canonical_theme "Gestion des utilisateurs et licences"
-   - "Smart Views" + "Vues intelligentes" + "Filtres et Smart Views" → "Smart Views et filtres"
-   - Choisis le nom le plus clair et complet pour chaque thème canonique
+const THEME_SYSTEM_PROMPT = `Tu es un rédacteur technique expert pour la FAQ produit AirSaas / PRC (SaaS B2B de gestion de projets).
 
-2. DÉDUPLIQUER — Identifie les entrées qui posent la MÊME question (même besoin sous-jacent) :
+Tu reçois un groupe d'entrées FAQ sur un même thème, extraites de conversations support Crisp.
+
+Ta mission en 2 étapes :
+
+1. DÉDUPLIQUER — Identifie les entrées qui posent la MÊME question (même besoin sous-jacent) :
    - Fusionne-les en UNE seule entrée
-   - Garde la meilleure suggested_faq_answer (la plus complète et claire)
-   - Merge les source_quotes (garde les plus pertinentes, max 5)
+   - Garde la meilleure réponse (la plus complète et claire)
+   - Merge les source_quotes (garde les plus pertinentes, max 3 par question)
    - Merge les circle_references (déduplique par URL)
-   - Garde le faq_score le plus élevé
+   - Supprime les entrées trop spécifiques ou qui décrivent un bug
 
-3. NETTOYER — Supprime les entrées :
-   - Trop spécifiques à un client malgré score >= 3
-   - Redondantes avec une autre entrée mieux formulée
-   - Qui décrivent un bug plutôt qu'une question FAQ
+2. GÉNÉRER LE MARKDOWN de cette section :
+   - Chaque question en H3 (###), classée par pertinence
+   - Réponse claire et actionnable en français
+   - Bloc <details><summary>Sources</summary> avec les citations verbatim </details>
+   - Liens vers les articles Circle pertinents après la réponse
+   - Formatage : "- " pour bullet points, "1. " pour listes numérotées, **Gras** pour sous-titres
 
-Réponds UNIQUEMENT en JSON valide, un tableau d'objets. Chaque objet DOIT avoir ces champs :
-- canonical_theme (string)
-- suggested_faq_title (string)
-- suggested_faq_answer (string, markdown formaté)
-- faq_score (number)
-- signal (string)
-- source_quotes (string[])
-- circle_references ({title: string, url: string}[])
-- underlying_need (string)
-- merged_count (number — combien d'entrées originales ont été fusionnées, 1 si pas de fusion)
-
-Pas de markdown, pas de backticks, pas de commentaires autour du JSON.`;
-
-const PHASE2_SYSTEM_PROMPT = `Tu es un rédacteur technique expert pour la FAQ produit AirSaas / PRC (SaaS B2B de gestion de projets).
-
-Tu reçois un ensemble consolidé d'entrées FAQ, déjà dédupliquées et groupées par thème. Génère un document Markdown structuré et professionnel.
-
-STRUCTURE DU DOCUMENT :
-1. Titre H1 + paragraphe d'introduction avec date et stats
-2. Table des matières avec liens internes vers chaque thème
-3. Pour chaque thème (H2), classé par nombre de questions décroissant :
-   - Pour chaque question (H3), classée par faq_score décroissant :
-     - Réponse claire et actionnable en français
-     - Bloc <details> "Sources" avec les citations verbatim
-     - Liens vers les articles Circle pertinents
-
-RÈGLES DE FORMATAGE :
-- Bullet points : "- " (tiret espace), sous-niveaux avec 2 espaces d'indentation
-- Listes numérotées : "1. " avec indentation cohérente
-- Ne jamais mixer bullet points et numéros dans la même liste
-- Sous-titres en **Gras** quand nécessaire dans les réponses
-- Ancres de la table des matières : slugifiées en minuscules, tirets pour les espaces
-- Les citations source dans <details><summary>Sources</summary>...</details>
-- Les références Circle comme liens markdown après la réponse
-
-IMPORTANT :
+RÈGLES :
 - Jamais de nom de client ou d'entreprise cliente
-- Le document doit être autonome et lisible
+- Réponses autonomes et lisibles
 - Écris en français
-- Réponds UNIQUEMENT avec le Markdown du document, rien d'autre`;
+- Réponds UNIQUEMENT avec le Markdown de cette section (pas de titre H2, juste les H3 et leur contenu)`;
 
 // ============================================
 // TASK
@@ -89,7 +131,7 @@ IMPORTANT :
 
 export const generateFaqDocument = task({
   id: "generate-faq-document",
-  maxDuration: 1800, // 30 min — multiple Opus streaming calls
+  maxDuration: 1800, // 30 min
   run: async (payload: { minScore?: number; dryRun?: boolean }) => {
     const startTime = Date.now();
     const minScore = payload.minScore ?? DEFAULT_MIN_SCORE;
@@ -108,118 +150,125 @@ export const generateFaqDocument = task({
         return { skipped: true, reason: "no_entries" };
       }
 
-      // 2. Split into batches
-      const batches: FaqEntry[][] = [];
-      for (let i = 0; i < allEntries.length; i += BATCH_SIZE) {
-        batches.push(allEntries.slice(i, i + BATCH_SIZE));
+      // 2. Group by normalized theme (programmatic — no AI needed)
+      const themeGroups = new Map<string, FaqEntry[]>();
+      for (const entry of allEntries) {
+        const canonical = normalizeTheme(entry.theme || "Autre");
+        const group = themeGroups.get(canonical) || [];
+        group.push(entry);
+        themeGroups.set(canonical, group);
       }
-      logger.info(`Split into ${batches.length} batches of ~${BATCH_SIZE}`);
 
-      // 3. Phase 1: Consolidation + dedup per batch
+      // Sort themes by entry count descending
+      const sortedThemes = [...themeGroups.entries()]
+        .sort((a, b) => b[1].length - a[1].length);
+
+      logger.info(`Grouped into ${sortedThemes.length} themes (from ${allEntries.length} entries)`);
+      for (const [theme, entries] of sortedThemes.slice(0, 10)) {
+        logger.info(`  ${theme}: ${entries.length} entries`);
+      }
+
+      if (dryRun) {
+        logger.info("Dry run — skipping Claude calls and save");
+        return {
+          dryRun: true,
+          entriesTotal: allEntries.length,
+          themeCount: sortedThemes.length,
+          themes: sortedThemes.map(([t, e]) => ({ theme: t, count: e.length })),
+        };
+      }
+
+      // 3. For each theme group: one Sonnet call (dedup + markdown section)
       const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-      const consolidatedAll: unknown[] = [];
+      const sections: Array<{ theme: string; markdown: string; entryCount: number }> = [];
+      let totalEntriesAfterDedup = 0;
 
-      for (let i = 0; i < batches.length; i++) {
-        const batch = batches[i];
-        logger.info(`Phase 1 — batch ${i + 1}/${batches.length} (${batch.length} entries)`);
+      for (let i = 0; i < sortedThemes.length; i++) {
+        const [theme, entries] = sortedThemes[i];
+        logger.info(`Processing theme ${i + 1}/${sortedThemes.length}: "${theme}" (${entries.length} entries)`);
 
-        const stripped = batch.map((e) => ({
-          theme: e.theme,
-          suggested_faq_title: e.suggested_faq_title,
-          suggested_faq_answer: e.suggested_faq_answer,
-          underlying_need: e.underlying_need,
-          faq_score: e.faq_score,
-          signal: e.signal,
-          source_quotes: e.source_quotes || [],
-          circle_references: e.circle_references || [],
+        // Compact JSON — no pretty-printing to save tokens
+        const compact = entries.map((e) => ({
+          t: e.suggested_faq_title,
+          a: e.suggested_faq_answer,
+          n: e.underlying_need,
+          s: e.faq_score,
+          sq: (e.source_quotes || []).slice(0, 3),
+          cr: (e.circle_references || []).slice(0, 3),
         }));
 
-        const result = await callClaudeJson(
-          client,
-          MODEL_PHASE1,
-          PHASE1_SYSTEM_PROMPT,
-          `Voici ${batch.length} entrées FAQ à consolider :\n\n${JSON.stringify(stripped, null, 2)}`,
-          MAX_TOKENS_PHASE1
-        );
+        const userPrompt = `Thème : "${theme}" — ${entries.length} entrées FAQ
 
-        if (result) {
-          consolidatedAll.push(...result);
-          logger.info(`Phase 1 batch ${i + 1}: ${batch.length} → ${result.length} entries`);
+Légende JSON : t=titre, a=réponse, n=besoin sous-jacent, s=score, sq=citations source, cr=références Circle
+
+${JSON.stringify(compact)}`;
+
+        const sectionMd = await callClaudeText(client, THEME_SYSTEM_PROMPT, userPrompt, MAX_TOKENS_PER_THEME);
+
+        if (sectionMd) {
+          const questionCount = (sectionMd.match(/^### /gm) || []).length;
+          totalEntriesAfterDedup += questionCount;
+          sections.push({ theme, markdown: sectionMd, entryCount: questionCount });
+          logger.info(`  → ${entries.length} entries → ${questionCount} questions`);
         } else {
-          logger.error(`Phase 1 batch ${i + 1} failed — keeping raw entries`);
-          consolidatedAll.push(...stripped);
+          logger.error(`  → Failed for theme "${theme}"`);
           errors.push({
-            label: `Phase 1 batch ${i + 1}`,
+            label: theme,
             inserted: 0,
-            skipped: batch.length,
-            errors: [{ type: "Claude", code: "PHASE1_FAIL", message: `Batch ${i + 1} consolidation failed` }],
+            skipped: entries.length,
+            errors: [{ type: "Claude", code: "THEME_FAIL", message: `Theme "${theme}" generation failed` }],
           });
         }
       }
 
-      logger.info(`Phase 1 complete: ${allEntries.length} → ${consolidatedAll.length} consolidated entries`);
-
-      if (dryRun) {
-        logger.info("Dry run — skipping Phase 2 and save");
-        return {
-          dryRun: true,
-          entriesBefore: allEntries.length,
-          entriesAfterPhase1: consolidatedAll.length,
-          batches: batches.length,
-        };
-      }
-
-      // 4. Phase 2: Markdown generation
-      logger.info(`Phase 2 — generating Markdown from ${consolidatedAll.length} entries`);
-
+      // 4. Assemble final document
       const today = new Date().toISOString().split("T")[0];
-      const phase2Prompt = `Voici ${consolidatedAll.length} entrées FAQ consolidées et dédupliquées à transformer en document Markdown.
+      const themeCount = sections.length;
 
-Date de génération : ${today}
-Nombre d'entrées originales : ${allEntries.length}
-Nombre après déduplication : ${consolidatedAll.length}
+      let markdown = `# FAQ Produit AirSaas / PRC\n\n`;
+      markdown += `> Document généré automatiquement le ${today} à partir de ${allEntries.length} entrées FAQ extraites de conversations support Crisp.\n`;
+      markdown += `> ${totalEntriesAfterDedup} questions uniques identifiées, regroupées en ${themeCount} thèmes.\n\n`;
 
-Entrées :
-${JSON.stringify(consolidatedAll, null, 2)}`;
+      // Table of contents
+      markdown += `## Table des matières\n\n`;
+      for (let i = 0; i < sections.length; i++) {
+        const slug = sections[i].theme
+          .toLowerCase()
+          .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-|-$/g, "");
+        markdown += `${i + 1}. [${sections[i].theme}](#${slug}) (${sections[i].entryCount})\n`;
+      }
+      markdown += `\n---\n\n`;
 
-      const markdown = await callClaudeText(client, MODEL_PHASE2, PHASE2_SYSTEM_PROMPT, phase2Prompt, MAX_TOKENS_PHASE2);
-
-      if (!markdown) {
-        logger.error("Phase 2 failed — no markdown generated");
-        errors.push({
-          label: "Phase 2 Markdown",
-          inserted: 0,
-          skipped: 0,
-          errors: [{ type: "Claude", code: "PHASE2_FAIL", message: "Markdown generation failed" }],
-        });
-        await sendErrorToScriptLogs("Generate FAQ Document", errors);
-        return { error: "phase2_failed", entriesConsolidated: consolidatedAll.length };
+      // Theme sections
+      for (const section of sections) {
+        markdown += `## ${section.theme}\n\n`;
+        markdown += section.markdown;
+        markdown += `\n\n---\n\n`;
       }
 
-      logger.info(`Phase 2 complete: ${markdown.length} chars`);
+      logger.info(`Document assembled: ${markdown.length} chars, ${themeCount} themes, ${totalEntriesAfterDedup} questions`);
 
-      // 5. Count themes in the markdown
-      const themeCount = (markdown.match(/^## /gm) || []).length;
-
-      // 6. Save to Supabase
+      // 5. Save to Supabase
       const stats = {
         total_entries_before: allEntries.length,
-        total_entries_after: consolidatedAll.length,
+        total_entries_after: totalEntriesAfterDedup,
         total_themes: themeCount,
         min_score: minScore,
       };
       const docMetadata = {
-        batch_count: batches.length,
+        batch_count: sortedThemes.length,
         generation_duration_ms: Date.now() - startTime,
       };
 
-      const version = await insertFaqDocument(markdown, `${MODEL_PHASE1} + ${MODEL_PHASE2}`, stats, docMetadata);
+      const version = await insertFaqDocument(markdown, MODEL, stats, docMetadata);
       logger.info(`Saved FAQ document v${version} to Supabase`);
 
-      // 7. Slack notification
+      // 6. Slack notification
       await sendSuccessSlack(version, stats, docMetadata);
 
-      // 8. Report any Phase 1 errors
+      // 7. Report errors
       if (errors.length > 0) {
         await sendErrorToScriptLogs("Generate FAQ Document", errors);
       }
@@ -227,7 +276,7 @@ ${JSON.stringify(consolidatedAll, null, 2)}`;
       try {
         metadata.set("version", version);
         metadata.set("entriesBefore", allEntries.length);
-        metadata.set("entriesAfter", consolidatedAll.length);
+        metadata.set("entriesAfter", totalEntriesAfterDedup);
         metadata.set("themes", themeCount);
         metadata.set("markdownLength", markdown.length);
         await metadata.flush();
@@ -238,7 +287,7 @@ ${JSON.stringify(consolidatedAll, null, 2)}`;
       return {
         version,
         entriesBefore: allEntries.length,
-        entriesAfter: consolidatedAll.length,
+        entriesAfter: totalEntriesAfterDedup,
         themes: themeCount,
         markdownLength: markdown.length,
         durationMs: Date.now() - startTime,
@@ -259,67 +308,15 @@ ${JSON.stringify(consolidatedAll, null, 2)}`;
 // HELPERS
 // ============================================
 
-async function callClaudeJson(
-  client: Anthropic,
-  model: string,
-  systemPrompt: string,
-  userPrompt: string,
-  maxTokens: number
-): Promise<unknown[] | null> {
-  const callOnce = async () => {
-    const stream = client.messages.stream({
-      model,
-      max_tokens: maxTokens,
-      temperature: TEMPERATURE,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userPrompt }],
-    });
-
-    const message = await stream.finalMessage();
-    const textBlock = message.content.find((b) => b.type === "text");
-    if (!textBlock || textBlock.type !== "text") return null;
-
-    let jsonText = textBlock.text.trim();
-    if (jsonText.startsWith("```")) {
-      jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-    }
-    if (!jsonText.startsWith("[")) {
-      const first = jsonText.indexOf("[");
-      const last = jsonText.lastIndexOf("]");
-      if (first !== -1 && last > first) {
-        jsonText = jsonText.slice(first, last + 1);
-      }
-    }
-
-    const parsed = JSON.parse(jsonText);
-    return Array.isArray(parsed) ? parsed : null;
-  };
-
-  try {
-    return await callOnce();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.warn(`Claude JSON call failed, retrying in 5s: ${msg}`);
-    await new Promise((r) => setTimeout(r, 5000));
-    try {
-      return await callOnce();
-    } catch (retryErr) {
-      logger.error(`Claude JSON call failed after retry: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
-      return null;
-    }
-  }
-}
-
 async function callClaudeText(
   client: Anthropic,
-  model: string,
   systemPrompt: string,
   userPrompt: string,
   maxTokens: number
 ): Promise<string | null> {
   const callOnce = async () => {
     const stream = client.messages.stream({
-      model,
+      model: MODEL,
       max_tokens: maxTokens,
       temperature: TEMPERATURE,
       system: systemPrompt,
@@ -336,12 +333,12 @@ async function callClaudeText(
     return await callOnce();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.warn(`Claude text call failed, retrying in 5s: ${msg}`);
+    logger.warn(`Claude call failed, retrying in 5s: ${msg}`);
     await new Promise((r) => setTimeout(r, 5000));
     try {
       return await callOnce();
     } catch (retryErr) {
-      logger.error(`Claude text call failed after retry: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+      logger.error(`Claude call failed after retry: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
       return null;
     }
   }
