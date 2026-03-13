@@ -63,8 +63,8 @@ Ta mission en 2 étapes :
 2. GÉNÉRER LE MARKDOWN de cette section :
    - Chaque question en H3 (###), classée par pertinence
    - Réponse claire et actionnable en français
-   - Bloc <details><summary>Sources</summary> avec les citations verbatim </details>
-   - Liens vers les articles Circle pertinents après la réponse
+   - Si des circle_references existent : ajouter après la réponse un bloc "**Ressources utiles :**" avec les liens (format: "- [titre](url)")
+   - Si des source_quotes existent : les mettre dans un bloc replié séparé <details><summary>Questions Crisp d'origine</summary> avec les citations verbatim </details>
    - Formatage : "- " pour bullet points, "1. " pour listes numérotées, **Gras** pour sous-titres
 
 RÈGLES :
@@ -313,21 +313,22 @@ function formatEntriesDirectly(entries: FaqEntry[]): string {
     lines.push(`### ${e.suggested_faq_title || "Question"}\n`);
     lines.push(`${e.suggested_faq_answer || ""}\n`);
 
-    const quotes = (e.source_quotes || []).filter(Boolean);
     const refs = (e.circle_references || []).filter((r) => r?.url);
+    if (refs.length > 0) {
+      lines.push(`**Ressources utiles :**`);
+      for (const r of refs) {
+        lines.push(`- [${r.title}](${r.url})`);
+      }
+      lines.push(``);
+    }
 
-    if (quotes.length > 0 || refs.length > 0) {
-      lines.push(`<details>\n<summary>Sources</summary>\n`);
+    const quotes = (e.source_quotes || []).filter(Boolean);
+    if (quotes.length > 0) {
+      lines.push(`<details>\n<summary>Questions Crisp d'origine</summary>\n`);
       for (const q of quotes) {
         lines.push(`> "${q}"\n`);
       }
-      if (refs.length > 0) {
-        lines.push(`\n**Références Circle :**`);
-        for (const r of refs) {
-          lines.push(`- [${r.title}](${r.url})`);
-        }
-      }
-      lines.push(`\n</details>\n`);
+      lines.push(`</details>\n`);
     }
   }
   return lines.join("\n");
