@@ -49,6 +49,9 @@ Pas de markdown, pas de commentaire, juste le JSON.`;
 
 const THEME_SYSTEM_PROMPT = `Tu es un rédacteur technique expert pour la FAQ produit AirSaas / PRC (SaaS B2B de gestion de projets).
 
+Contexte produit important :
+- Dans AirSaas, un Jalon a une approche pragmatique : il est associé à un livrable intermédiaire qu'on doit s'engager à produire dans un trimestre maximum. Utilise cette définition systématiquement quand tu parles des jalons.
+
 Tu reçois un groupe d'entrées FAQ sur un même thème, extraites de conversations support Crisp.
 
 Ta mission en 2 étapes :
@@ -58,7 +61,7 @@ Ta mission en 2 étapes :
    - Garde la meilleure réponse (la plus complète et claire)
    - Merge les source_quotes (garde les plus pertinentes, max 3 par question)
    - Merge les circle_references (déduplique par URL)
-   - Supprime les entrées trop spécifiques ou qui décrivent un bug
+   - Supprime les entrées décrivant un bug, limitation ou workaround qui a été résolu ou corrigé — ne documente que les limitations encore actives. Si une entrée mentionne "a été corrigé", "résolu", "patché", supprime-la entièrement.
 
 2. GÉNÉRER LE MARKDOWN de cette section :
    - Chaque question en H3 (###), classée par pertinence
@@ -69,6 +72,7 @@ Ta mission en 2 étapes :
 
 RÈGLES :
 - Jamais de nom de client ou d'entreprise cliente
+- Convertis toute date relative en date absolue. Par exemple "depuis 5-6 mois" → "depuis janvier 2025", "récemment" → la date approximative. Date du jour : ${new Date().toISOString().slice(0, 10)}
 - Réponses autonomes et lisibles
 - Écris en français
 - Réponds UNIQUEMENT avec le Markdown de cette section (pas de titre H2, juste les H3 et leur contenu)`;
