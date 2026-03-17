@@ -40,6 +40,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/import-circle-posts.ts` — weekly sync of Circle posts + comments from `ca-vient-de-sortir` space → Supabase `circle_posts` (tchat-support-sync project), incremental via `circle_sync_cursor`
 - `trigger/generate-faq-document.ts` — manual task: reads `tchat_faq_extractions` (score >= 3), consolidates themes + deduplicates via Claude Opus in batches, generates structured Markdown FAQ document, saves to `tchat_faq_documents`
 - `trigger/audit-circle-documentation.ts` — manual task: cross-references FAQ extractions with Circle articles, produces audit report with article rewrites (image-preserving), new article drafts, and orphan detection. Resume support via `tchat_doc_audit_items`. Saves to `tchat_faq_documents` with type `doc_audit`
+- `trigger/propose-faq-updates.ts` — manual monthly task: compares recent Crisp extractions + Circle articles against approved FAQ reference, produces HTML proposal with new questions, answer updates (before/after diff), removals, and Circle article suggestions. 2-pass Opus architecture. Saves to `tchat_faq_documents` with type `faq_proposal`
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
@@ -105,6 +106,8 @@ flowchart LR
     GFD --> SB_CR & SL
     SB_CR --> ACD[audit-circle-documentation]
     ACD --> SB_CR & SL
+    SB_CR --> PFU[propose-faq-updates]
+    PFU --> SB_CR & SL
     WUR --> SL
 ```
 
@@ -536,6 +539,33 @@ flowchart TD
     T --> U{{Slack API: chat.postMessage<br/>channel C032ZPKB51S}}
 
     C -->|Erreurs| V{{sendErrorToScriptLogs}}
+```
+
+### `propose-faq-updates` (manual monthly)
+
+```mermaid
+flowchart TD
+    A([Manuel mensuel]) --> B[Lire FAQ de référence<br/>tchat_faq_documents type=faq_approved]
+    B --> C{FAQ trouvée ?}
+    C -->|Non| D[Erreur: upload FAQ d'abord]
+    C -->|Oui| E[Parser TOC + index par question]
+
+    E --> F[Fetch extractions Crisp<br/>derniers 30 jours, score >= 3]
+    F --> G[Fetch articles Circle<br/>derniers 30 jours]
+
+    G --> H{Passe 1 — Triage<br/>Opus : TOC + extractions<br/>batchs de 50}
+    H --> I[JSON propositions :<br/>new_question / update_answer<br/>remove_question / update_article<br/>new_article]
+
+    I --> J[Dédupliquer propositions]
+    J --> K{Passe 2 — Détail}
+    K -->|update_answer| L[Opus : contenu FAQ actuel<br/>+ extractions → avant/après]
+    K -->|new_question| M[Opus : extractions<br/>→ titre + réponse]
+    K -->|update/new article| N[Opus : article Circle<br/>+ extractions → proposition]
+    K -->|remove_question| O[Raison suffisante]
+
+    L & M & N & O --> P[Assembler HTML<br/>diff coloré + TOC]
+    P --> Q[Insert tchat_faq_documents<br/>type = faq_proposal]
+    Q --> R{{Slack: script_logs}}
 ```
 
 ## Important Rules
