@@ -19,6 +19,13 @@ const BERTRAN_HUBSPOT_OWNER_ID = "48901672";
 const SLACK_CHANNEL_LOGERROR_ID = "C0AAXKPRKT8";
 const MIN_EMPLOYEES_FOR_HUBSPOT = 500;
 
+// Slack channels dédiés par sales (intent owner name → channel ID)
+// Used by sendSlackIaNotification to route interactive activation messages
+const SLACK_IA_CHANNELS: Record<string, string> = {
+  "Thomas Doret": "C0A76PH8K09",
+  "Bertran Ruiz": "C0AB8RV58Q6",
+};
+
 const EXCLUDED_LINKEDIN_PROFILES = [
   "https://www.linkedin.com/in/stephan-boisson-3ba61950/",
   "https://www.linkedin.com/in/benitodiz/",
@@ -720,6 +727,140 @@ async function assignHubspotOwnerAndActivate(
   }
 }
 
+async function assignHubspotOwnerOnly(
+  contactHubspotId: string,
+  ownerHubspotId: string
+): Promise<{ success: boolean }> {
+  const token = process.env.HUBSPOT_ACCESS_TOKEN ?? "";
+  const url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactHubspotId}`;
+
+  try {
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        properties: {
+          hubspot_owner_id: ownerHubspotId,
+        },
+      }),
+    });
+
+    if (res.ok) {
+      logger.info(
+        `HubSpot ASSIGN OK - Contact: ${contactHubspotId}, owner: ${ownerHubspotId}`
+      );
+      return { success: true };
+    } else {
+      const text = await res.text();
+      logger.error(`HubSpot ASSIGN error ${res.status}: ${text}`);
+      return { success: false };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`HubSpot ASSIGN exception: ${msg}`);
+    return { success: false };
+  }
+}
+
+async function sendSlackIaNotification(params: {
+  channelId: string;
+  contactName: string;
+  contactJob: string;
+  companyName: string;
+  linkedinUrl: string;
+  hubspotContactId: string;
+  intentEventType: string;
+  intentOwner: string;
+  companySize: string;
+}): Promise<{ success: boolean }> {
+  const token = process.env.slack_agent_ae_sdr_token ?? "";
+  if (!token) {
+    logger.error("Missing slack_agent_ae_sdr_token env var");
+    return { success: false };
+  }
+
+  const hubspotUrl = `${HUBSPOT_CONTACT_BASE_URL}/${params.hubspotContactId}`;
+  const valuePayload = JSON.stringify({
+    hubspot_contact_id: params.hubspotContactId,
+    contact_name: params.contactName,
+  });
+
+  const body = {
+    channel: params.channelId,
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: [
+            `*Activer l'Agent IA ?*`,
+            `*Contact :* <${params.linkedinUrl}|${params.contactName}>`,
+            `*Poste :* ${params.contactJob}`,
+            `*Entreprise :* ${params.companyName} (${params.companySize} employés)`,
+            `*Événement :* ${params.intentEventType}`,
+            `*Intent Owner :* ${params.intentOwner}`,
+            `*HubSpot :* <${hubspotUrl}|${params.hubspotContactId}>`,
+          ].join("\n"),
+        },
+      },
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "Activer", emoji: true },
+            style: "primary",
+            action_id: "activate_ia",
+            value: valuePayload,
+          },
+          {
+            type: "button",
+            text: { type: "plain_text", text: "Ne jamais activer", emoji: true },
+            style: "danger",
+            action_id: "never_activate",
+            value: valuePayload,
+          },
+          {
+            type: "button",
+            text: { type: "plain_text", text: "Pas maintenant", emoji: true },
+            action_id: "skip_now",
+            value: valuePayload,
+          },
+        ],
+      },
+    ],
+  };
+
+  try {
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const data = await res.json();
+    if (data.ok) {
+      logger.info(
+        `Slack IA notif sent to ${params.channelId} for ${params.contactName}`
+      );
+      return { success: true };
+    } else {
+      logger.error(`Slack IA notif error: ${data.error}`);
+      return { success: false };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`Slack IA notif exception: ${msg}`);
+    return { success: false };
+  }
+}
+
 async function createHubspotContact(
   record: ConcurrentContact,
   ownerId: string
@@ -1018,10 +1159,11 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
         const intentOwner = record.INTENT_OWNER;
 
         if (!businessOwner) {
-          // Cas 1: BUSINESS_OWNER is null → assign intent owner as HubSpot owner + activate
+          // Cas 1: BUSINESS_OWNER is null → assign owner immediately, then Slack notif for activation
           const intentOwnerHubspotId = getHubspotIdForIntentOwner(intentOwner, teamMembers);
           if (intentOwnerHubspotId) {
-            const assignResult = await assignHubspotOwnerAndActivate(
+            // Step 1: Assign owner only (no activation)
+            const assignResult = await assignHubspotOwnerOnly(
               contactHubspotId,
               intentOwnerHubspotId
             );
@@ -1029,12 +1171,47 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
               ...logBase, destination: "HUBSPOT_ASSIGN",
               hubspot_contact_id: contactHubspotId, hubspot_success: assignResult.success,
             });
-            if (assignResult.success) {
-              hubspotSuccess++;
-            } else {
+
+            if (!assignResult.success) {
               hubspotFailed++;
+              shouldSendSlack = false;
+            } else {
+              // Step 2: Check cancel before sending notification
+              const cancelResult = await getHubspotContactCancelStatus(contactHubspotId);
+              if (cancelResult.success && cancelResult.cancelValue !== null &&
+                  cancelResult.cancelValue !== "" && cancelResult.cancelValue !== undefined) {
+                logger.info(`HubSpot skip notif - cancel_agent_ia non-empty for ${fullName} (owner assigned)`);
+                hubspotSuccess++;
+                shouldSendSlack = true;
+              } else {
+                // Step 3: Send Slack interactive notification
+                const slackChannelId = SLACK_IA_CHANNELS[intentOwner ?? ""];
+                if (slackChannelId) {
+                  const companySizeStr = String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?");
+                  const notifResult = await sendSlackIaNotification({
+                    channelId: slackChannelId,
+                    contactName: fullName,
+                    contactJob: record.CONTACT_JOB ?? "",
+                    companyName: record.COMPANY_NAME ?? "",
+                    linkedinUrl: record.CONTACT_LINKEDIN_PROFILE_URL ?? "",
+                    hubspotContactId: contactHubspotId,
+                    intentEventType: record.INTENT_EVENT_TYPE ?? "",
+                    intentOwner: intentOwner ?? "",
+                    companySize: companySizeStr,
+                  });
+                  logRoutingDecision({
+                    ...logBase, destination: "SLACK_NOTIF_SENT",
+                    hubspot_contact_id: contactHubspotId, hubspot_success: notifResult.success,
+                  });
+                  hubspotSuccess++;
+                  shouldSendSlack = notifResult.success;
+                } else {
+                  logger.warn(`No Slack channel configured for intent owner: ${intentOwner}`);
+                  hubspotSuccess++;
+                  shouldSendSlack = true;
+                }
+              }
             }
-            shouldSendSlack = assignResult.success;
           } else {
             logger.warn(`No HubSpot ID found for intent owner: ${intentOwner}`);
             logRoutingDecision({
@@ -1045,7 +1222,7 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             shouldSendSlack = false;
           }
         } else if (businessOwner === intentOwner) {
-          // Cas 2: BUSINESS_OWNER = INTENT_OWNER → existing logic (check cancel, then activate)
+          // Cas 2: BUSINESS_OWNER = INTENT_OWNER → check cancel, then Slack notif for activation
           const getResult =
             await getHubspotContactCancelStatus(contactHubspotId);
 
@@ -1071,18 +1248,36 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             hubspotSkipped++;
             shouldSendSlack = false;
           } else {
-            const updateResult =
-              await updateHubspotContactAgentActivated(contactHubspotId);
-            logRoutingDecision({
-              ...logBase, destination: "HUBSPOT_ACTIVATE",
-              hubspot_contact_id: contactHubspotId, hubspot_success: updateResult.success,
-            });
-            if (updateResult.success) {
-              hubspotSuccess++;
+            // Send Slack interactive notification instead of auto-activating
+            const slackChannelId = SLACK_IA_CHANNELS[intentOwner ?? ""];
+            if (slackChannelId) {
+              const companySizeStr = String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?");
+              const notifResult = await sendSlackIaNotification({
+                channelId: slackChannelId,
+                contactName: fullName,
+                contactJob: record.CONTACT_JOB ?? "",
+                companyName: record.COMPANY_NAME ?? "",
+                linkedinUrl: record.CONTACT_LINKEDIN_PROFILE_URL ?? "",
+                hubspotContactId: contactHubspotId,
+                intentEventType: record.INTENT_EVENT_TYPE ?? "",
+                intentOwner: intentOwner ?? "",
+                companySize: companySizeStr,
+              });
+              logRoutingDecision({
+                ...logBase, destination: "SLACK_NOTIF_SENT",
+                hubspot_contact_id: contactHubspotId, hubspot_success: notifResult.success,
+              });
+              if (notifResult.success) {
+                hubspotSuccess++;
+              } else {
+                hubspotFailed++;
+              }
+              shouldSendSlack = notifResult.success;
             } else {
-              hubspotFailed++;
+              logger.warn(`No Slack channel configured for intent owner: ${intentOwner}`);
+              hubspotSuccess++;
+              shouldSendSlack = true;
             }
-            shouldSendSlack = updateResult.success;
           }
         } else {
           // Cas 3: BUSINESS_OWNER ≠ INTENT_OWNER → skip for now
