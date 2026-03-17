@@ -84,10 +84,10 @@ RÈGLES :
 export const generateFaqDocument = task({
   id: "generate-faq-document",
   maxDuration: 2400, // 40 min
-  run: async (payload: { minScore?: number; dryRun?: boolean }) => {
+  run: async (payload?: { minScore?: number; dryRun?: boolean }) => {
     const startTime = Date.now();
-    const minScore = payload.minScore ?? DEFAULT_MIN_SCORE;
-    const dryRun = payload.dryRun ?? false;
+    const minScore = payload?.minScore ?? DEFAULT_MIN_SCORE;
+    const dryRun = payload?.dryRun ?? false;
     const errors: TaskResultGroup[] = [];
 
     logger.info(`=== START generate-faq-document (minScore=${minScore}, dryRun=${dryRun}) ===`);
