@@ -261,22 +261,24 @@ export interface FaqCursor {
   lastProcessedOffset: number;
   totalConversations: number | null;
   isDone: boolean;
+  lastRunAt: string | null;
 }
 
 export async function getFaqCursor(): Promise<FaqCursor> {
   const { data } = await getCrispSupabase()
     .from("tchat_faq_cursor")
-    .select("last_processed_offset, total_conversations, is_done")
+    .select("last_processed_offset, total_conversations, is_done, last_run_at")
     .eq("id", "default")
     .single();
 
   if (!data) {
-    return { lastProcessedOffset: 0, totalConversations: null, isDone: false };
+    return { lastProcessedOffset: 0, totalConversations: null, isDone: false, lastRunAt: null };
   }
   return {
     lastProcessedOffset: data.last_processed_offset,
     totalConversations: data.total_conversations,
     isDone: data.is_done,
+    lastRunAt: data.last_run_at,
   };
 }
 
@@ -302,16 +304,30 @@ export async function updateFaqCursor(
 
 export async function getConversationsForFaq(
   offset: number,
-  limit: number
+  limit: number,
+  since?: string
 ): Promise<Array<{ session_id: string; contact_name: string | null; first_message_at: string; last_message_at: string; message_count_inbound: number; message_count_outbound: number }>> {
-  const since = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+  const sinceDate = since ?? new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
 
-  const { data, error } = await getCrispSupabase()
+  let query = getCrispSupabase()
     .from("tchat_conversations")
     .select("session_id, contact_name, first_message_at, last_message_at, message_count_inbound, message_count_outbound")
-    .gte("first_message_at", since)
-    .order("first_message_at", { ascending: true })
-    .range(offset, offset + limit - 1);
+    .gte("first_message_at", sinceDate)
+    .order("first_message_at", { ascending: true });
+
+  if (since) {
+    // Incremental mode: also include conversations updated since last run
+    query = getCrispSupabase()
+      .from("tchat_conversations")
+      .select("session_id, contact_name, first_message_at, last_message_at, message_count_inbound, message_count_outbound")
+      .gte("last_message_at", sinceDate)
+      .order("last_message_at", { ascending: true })
+      .range(offset, offset + limit - 1);
+  } else {
+    query = query.range(offset, offset + limit - 1);
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`getConversationsForFaq: ${error.message}`);
@@ -567,6 +583,108 @@ export async function getAllCirclePosts(): Promise<CirclePostForAudit[]> {
     .order("published_at", { ascending: false });
 
   if (error) throw new Error(`getAllCirclePosts: ${error.message}`);
+  return (data || []) as CirclePostForAudit[];
+}
+
+// ============================================
+// FAQ approved reference
+// ============================================
+
+export async function getFaqApproved(): Promise<{ markdown: string; version: number; generated_at: string } | null> {
+  const { data, error } = await getCrispSupabase()
+    .from("tchat_faq_documents")
+    .select("markdown, version, generated_at")
+    .eq("type", "faq_approved")
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw new Error(`getFaqApproved: ${error.message}`);
+  return data;
+}
+
+export async function upsertFaqApproved(markdown: string): Promise<number> {
+  const sb = getCrispSupabase();
+
+  // Check if an approved FAQ already exists
+  const { data: existing } = await sb
+    .from("tchat_faq_documents")
+    .select("id, version")
+    .eq("type", "faq_approved")
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (existing) {
+    // Update existing entry
+    const { error } = await sb
+      .from("tchat_faq_documents")
+      .update({
+        markdown,
+        generated_at: new Date().toISOString(),
+      })
+      .eq("id", existing.id);
+
+    if (error) throw new Error(`upsertFaqApproved update: ${error.message}`);
+    return existing.version;
+  } else {
+    // Insert new entry
+    return insertFaqDocumentWithType(markdown, "manual", {}, {}, "faq_approved");
+  }
+}
+
+// ============================================
+// Recent FAQ extractions & Circle posts (for propose-faq-updates)
+// ============================================
+
+export async function getRecentFaqExtractions(sinceDays: number): Promise<FaqEntry[]> {
+  const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+  const sb = getCrispSupabase();
+  const PAGE_SIZE = 1000;
+  const allEntries: FaqEntry[] = [];
+  let offset = 0;
+
+  while (true) {
+    const { data, error } = await sb
+      .from("tchat_faq_extractions")
+      .select("session_id, extractions, updated_at")
+      .gte("updated_at", since)
+      .range(offset, offset + PAGE_SIZE - 1);
+
+    if (error) throw new Error(`getRecentFaqExtractions: ${error.message}`);
+    if (!data || data.length === 0) break;
+
+    for (const row of data) {
+      const extractions = typeof row.extractions === "string"
+        ? JSON.parse(row.extractions)
+        : row.extractions;
+
+      if (!Array.isArray(extractions)) continue;
+
+      for (const entry of extractions) {
+        if ((entry.faq_score ?? 0) >= 3) {
+          allEntries.push({ ...entry, session_id: row.session_id });
+        }
+      }
+    }
+
+    if (data.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
+  }
+
+  return allEntries;
+}
+
+export async function getRecentCirclePosts(sinceDays: number): Promise<CirclePostForAudit[]> {
+  const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await getCrispSupabase()
+    .from("circle_posts")
+    .select("id, name, url, space_slug, space_name, body_html, body_plain_text, comments, comments_count, published_at")
+    .eq("status", "published")
+    .gte("updated_at", since)
+    .order("published_at", { ascending: false });
+
+  if (error) throw new Error(`getRecentCirclePosts: ${error.message}`);
   return (data || []) as CirclePostForAudit[];
 }
 

@@ -149,22 +149,35 @@ export const extractFaqFromCrisp = task({
 
     // 1. Read cursor
     const cursor = await getFaqCursor();
+
+    // Incremental mode: if done, reset and process only new conversations since last run
+    let since: string | undefined;
+    let offset: number;
+
     if (cursor.isDone) {
-      logger.info("FAQ extraction already done, skipping");
-      return { skipped: true, reason: "done" };
+      if (!cursor.lastRunAt) {
+        logger.info("FAQ extraction done and no lastRunAt — nothing to do");
+        return { skipped: true, reason: "done_no_last_run" };
+      }
+      logger.info(`Incremental mode: processing conversations updated since ${cursor.lastRunAt}`);
+      since = cursor.lastRunAt;
+      offset = 0;
+      // Reset cursor for incremental run
+      await updateFaqCursor(0, false);
+    } else {
+      offset = cursor.lastProcessedOffset;
     }
 
-    const offset = cursor.lastProcessedOffset;
-    logger.info(`Starting from offset ${offset}`);
+    logger.info(`Starting from offset ${offset}${since ? ` (since ${since})` : ""}`);
 
     // 2. Fetch conversations
-    const conversations = await getConversationsForFaq(offset, BATCH_SIZE + 10);
+    const conversations = await getConversationsForFaq(offset, BATCH_SIZE + 10, since);
 
     if (conversations.length === 0) {
       logger.info("No more conversations to process, marking done");
       await updateFaqCursor(offset, true);
       await sendFaqCompletionSlack(offset);
-      return { done: true, totalProcessed: offset };
+      return { done: true, totalProcessed: offset, incremental: !!since };
     }
 
     const batch = conversations.slice(0, BATCH_SIZE);
@@ -204,6 +217,7 @@ export const extractFaqFromCrisp = task({
       metadata.set("offset", newOffset);
       metadata.set("triggered", batch.length);
       metadata.set("nextBatchDelay", `${totalDelayS}s`);
+      metadata.set("incremental", !!since);
       await metadata.flush();
     } catch {
       // metadata may not be available
@@ -214,6 +228,7 @@ export const extractFaqFromCrisp = task({
       triggered: batch.length,
       children: triggered,
       nextBatchIn: `${totalDelayS}s`,
+      incremental: !!since,
     };
   },
 });
