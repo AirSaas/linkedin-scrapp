@@ -1,0 +1,21 @@
+{
+  "name": "tokyo",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "npx trigger.dev@latest dev"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.76.0",
+    "@supabase/supabase-js": "^2.95.3",
+    "@trigger.dev/sdk": "^4.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  }
+}
