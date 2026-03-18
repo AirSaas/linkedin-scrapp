@@ -33,7 +33,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
-- `trigger/send-contacts-to-langgraph.ts` — daily cron: fetches PRC_CONTACT_ACTIVITIES (ai_ae_sdr_agent Supabase `rcpcdpxqjxeikbssprdz`), skips contacts with final_decision < 3 days, prioritizes active pipeline SQL deals (Tier 1) then FIFO by oldest decision, caps at 30 contacts/run, sends to LangGraph async /runs endpoint
+- `trigger/send-contacts-to-langgraph.ts` — daily cron: fetches PRC_CONTACT_ACTIVITIES (ai_ae_sdr_agent Supabase `rcpcdpxqjxeikbssprdz`), skips contacts with final_decision < 3 days, prioritizes active pipeline SQL deals (Tier 1) then FIFO by oldest decision, caps at 15 contacts/owner/run, sends to LangGraph async /runs endpoint
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
@@ -373,23 +373,27 @@ flowchart TD
     B --> C[Filtrer IS_CONTACT_IA_AGENT_ACTIVATED = true<br/>ET IS_CANCEL_AGENT_IA_ACTIVATED != true]
     C --> D[Grouper par CONTACT_HUBSPOT_ID]
 
-    D --> E[Fetch final_decision<br/>created_at >= J-3]
-    E --> F{Pour chaque contact}
-    F -->|final_decision < 3j| G[Skip: cooldown]
-    F -->|Éligible| H{Deal actif<br/>pipeline SQL ?}
-    H -->|Oui| I[Tier 1]
-    H -->|Non| J[Tier 2]
+    D --> E[Résoudre owner par contact<br/>OWNER_CONTACT_INTENT_HUBSPOT.owner_hubspot_id]
+    E -->|Pas d'owner| F[Skip]
 
-    I & J --> K[Trier par ancienneté<br/>dernière final_decision<br/>jamais traité = priorité max]
-    K --> L[Prendre max 30 contacts]
+    E --> G[Fetch final_decision<br/>created_at >= J-3]
+    G --> H{Pour chaque owner}
+    H --> I{Pour chaque contact}
+    I -->|final_decision < 3j| J[Skip: cooldown]
+    I -->|Éligible| K{Deal actif<br/>pipeline SQL ?}
+    K -->|Oui| L[Tier 1]
+    K -->|Non| M[Tier 2]
 
-    L --> M{Pour chaque contact}
-    M --> N[Construire JSON payload<br/>contact_info + activities + stats]
-    N --> O[POST LangGraph /runs<br/>assistant_id: full_pipeline]
-    O -->|Success| P[Log sent]
-    O -->|Error| Q[Log error]
-    M -->|All done| R{{Slack: script_logs<br/>éligibles / skippés / envoyés / restants}}
-    M -->|Errors| S{{sendErrorToScriptLogs}}
+    L & M --> N[Trier par ancienneté<br/>dernière final_decision<br/>jamais traité = priorité max]
+    N --> O[Prendre max 15 contacts/owner]
+
+    O --> P{Pour chaque contact}
+    P --> Q[Construire JSON payload<br/>contact_info + activities + stats]
+    Q --> R[POST LangGraph /runs<br/>assistant_id: full_pipeline]
+    R -->|Success| S[Log sent]
+    R -->|Error| T[Log error]
+    P -->|All done| U{{Slack: script_logs<br/>recap par owner}}
+    P -->|Errors| V{{sendErrorToScriptLogs}}
 ```
 
 ### `batch-crisp-to-supabase` (manual)

@@ -12,7 +12,7 @@ import {
 const LANGGRAPH_ASSISTANT_ID = "full_pipeline";
 const RATE_LIMIT_BETWEEN_SENDS = 2000;
 const PAGE_SIZE = 1000;
-const MAX_CONTACTS_PER_RUN = 30;
+const MAX_CONTACTS_PER_OWNER = 15;
 const COOLDOWN_DAYS = 3;
 
 // Pipeline SQL active deal stages — contacts with at least one of these
@@ -107,6 +107,18 @@ interface ContactPayload {
   };
 }
 
+interface OwnerStats {
+  ownerName: string;
+  totalEligible: number;
+  cooldownSkipped: number;
+  noOwnerSkipped?: boolean;
+  tier1: number;
+  tier2: number;
+  sent: number;
+  errored: number;
+  remaining: number;
+}
+
 // ============================================
 // SCHEDULED TASK
 // ============================================
@@ -150,7 +162,24 @@ export const sendContactsToLanggraphTask = schedules.task({
     const allContactIds = Object.keys(grouped);
     logger.info(`${allContactIds.length} unique contacts`);
 
-    // 4. Fetch recent final_decisions (last COOLDOWN_DAYS days) to exclude
+    // 4. Resolve owner for each contact (from OWNER_CONTACT_INTENT_HUBSPOT.owner_hubspot_id)
+    const contactOwnerMap = new Map<string, { id: string; name: string }>();
+    const noOwnerSkipped: string[] = [];
+
+    for (const contactId of allContactIds) {
+      const owner = getContactOwner(grouped[contactId]);
+      if (owner) {
+        contactOwnerMap.set(contactId, owner);
+      } else {
+        noOwnerSkipped.push(contactId);
+      }
+    }
+
+    logger.info(
+      `${contactOwnerMap.size} contacts with owner | ${noOwnerSkipped.length} skipped (no owner)`
+    );
+
+    // 5. Fetch recent final_decisions (last COOLDOWN_DAYS days) for cooldown
     const cooldownDate = new Date(
       Date.now() - COOLDOWN_DAYS * 24 * 60 * 60 * 1000
     ).toISOString();
@@ -164,18 +193,12 @@ export const sendContactsToLanggraphTask = schedules.task({
       throw new Error(`Failed to fetch final_decision: ${fdError.message}`);
     }
 
-    // Build map: contact_hubspot_id → most recent created_at
-    const lastDecisionMap = new Map<string, string>();
+    const recentDecisionSet = new Set<string>();
     for (const row of recentDecisions ?? []) {
-      const cid = row.contact_hubspot_id;
-      if (!cid) continue;
-      const existing = lastDecisionMap.get(cid);
-      if (!existing || row.created_at > existing) {
-        lastDecisionMap.set(cid, row.created_at);
-      }
+      if (row.contact_hubspot_id) recentDecisionSet.add(row.contact_hubspot_id);
     }
 
-    // Also fetch ALL final_decisions to know last decision date for prioritization
+    // Fetch ALL final_decisions for prioritization (oldest decision first)
     const { data: allDecisions, error: allFdError } = await sb
       .from("final_decision")
       .select("contact_hubspot_id, created_at");
@@ -196,76 +219,102 @@ export const sendContactsToLanggraphTask = schedules.task({
       }
     }
 
-    // 5. Filter out contacts in cooldown
-    const cooldownSkipped: string[] = [];
-    const eligible: string[] = [];
+    // 6. Group contacts by owner, then apply cooldown + prioritization per owner
+    const ownerContacts = new Map<string, { name: string; contactIds: string[] }>();
 
-    for (const contactId of allContactIds) {
-      if (lastDecisionMap.has(contactId)) {
-        cooldownSkipped.push(contactId);
-      } else {
-        eligible.push(contactId);
+    for (const [contactId, owner] of contactOwnerMap) {
+      let entry = ownerContacts.get(owner.id);
+      if (!entry) {
+        entry = { name: owner.name, contactIds: [] };
+        ownerContacts.set(owner.id, entry);
       }
+      entry.contactIds.push(contactId);
     }
 
-    logger.info(
-      `${eligible.length} eligible | ${cooldownSkipped.length} skipped (decision < ${COOLDOWN_DAYS}d)`
-    );
+    const ownerStatsMap = new Map<string, OwnerStats>();
+    const toSendAll: { contactId: string; ownerId: string }[] = [];
 
-    // 6. Prioritize: Tier 1 (active deal) > Tier 2 (no active deal)
-    // Within each tier: never processed first, then oldest decision first
-    const tier1: string[] = [];
-    const tier2: string[] = [];
+    for (const [ownerId, { name: ownerName, contactIds }] of ownerContacts) {
+      const cooldownSkipped: string[] = [];
+      const eligible: string[] = [];
 
-    for (const contactId of eligible) {
-      if (hasActiveDeal(grouped[contactId])) {
-        tier1.push(contactId);
-      } else {
-        tier2.push(contactId);
+      for (const contactId of contactIds) {
+        if (recentDecisionSet.has(contactId)) {
+          cooldownSkipped.push(contactId);
+        } else {
+          eligible.push(contactId);
+        }
       }
+
+      // Prioritize: Tier 1 (active deal) > Tier 2, then FIFO by oldest decision
+      const tier1: string[] = [];
+      const tier2: string[] = [];
+
+      for (const contactId of eligible) {
+        if (hasActiveDeal(grouped[contactId])) {
+          tier1.push(contactId);
+        } else {
+          tier2.push(contactId);
+        }
+      }
+
+      const sortByDecisionAge = (a: string, b: string) => {
+        const aDate = allLastDecisionMap.get(a);
+        const bDate = allLastDecisionMap.get(b);
+        if (!aDate && bDate) return -1;
+        if (aDate && !bDate) return 1;
+        if (!aDate && !bDate) return 0;
+        return aDate! < bDate! ? -1 : aDate! > bDate! ? 1 : 0;
+      };
+
+      tier1.sort(sortByDecisionAge);
+      tier2.sort(sortByDecisionAge);
+
+      const prioritized = [...tier1, ...tier2];
+      const toSend = prioritized.slice(0, MAX_CONTACTS_PER_OWNER);
+      const remaining = prioritized.length - toSend.length;
+
+      for (const contactId of toSend) {
+        toSendAll.push({ contactId, ownerId });
+      }
+
+      ownerStatsMap.set(ownerId, {
+        ownerName,
+        totalEligible: contactIds.length,
+        cooldownSkipped: cooldownSkipped.length,
+        tier1: tier1.length,
+        tier2: tier2.length,
+        sent: 0, // updated after sending
+        errored: 0,
+        remaining,
+      });
+
+      logger.info(
+        `[${ownerName}] ${eligible.length} eligible (${cooldownSkipped.length} cooldown) | T1: ${tier1.length} T2: ${tier2.length} | Sending: ${toSend.length} | Remaining: ${remaining}`
+      );
     }
-
-    const sortByDecisionAge = (a: string, b: string) => {
-      const aDate = allLastDecisionMap.get(a);
-      const bDate = allLastDecisionMap.get(b);
-      // Never processed → priority (sort first)
-      if (!aDate && bDate) return -1;
-      if (aDate && !bDate) return 1;
-      if (!aDate && !bDate) return 0;
-      // Both have decisions: oldest first
-      return aDate! < bDate! ? -1 : aDate! > bDate! ? 1 : 0;
-    };
-
-    tier1.sort(sortByDecisionAge);
-    tier2.sort(sortByDecisionAge);
-
-    const prioritized = [...tier1, ...tier2];
-    const toSend = prioritized.slice(0, MAX_CONTACTS_PER_RUN);
-    const remaining = prioritized.length - toSend.length;
-
-    logger.info(
-      `Tier 1 (active deal): ${tier1.length} | Tier 2: ${tier2.length} | Sending: ${toSend.length} | Remaining: ${remaining}`
-    );
 
     // 7. Send each contact to LangGraph
-    let sentCount = 0;
-    let errorCount = 0;
+    let totalSent = 0;
+    let totalErrors = 0;
 
-    for (const contactId of toSend) {
+    for (const { contactId, ownerId } of toSendAll) {
       const activities = grouped[contactId];
+      const stats = ownerStatsMap.get(ownerId)!;
 
       try {
         const payload = buildContactPayload(contactId, activities);
         const lgResult = await sendToLangGraph(payload);
 
         if (lgResult.success) {
-          sentCount++;
-          const tier = tier1.includes(contactId) ? "T1" : "T2";
+          totalSent++;
+          stats.sent++;
           logger.info(
-            `[${tier}] Sent ${contactId} (${payload.contact_info.full_name}) — ${payload.stats.total_activities} activities`
+            `[${stats.ownerName}] Sent ${contactId} (${payload.contact_info.full_name}) — ${payload.stats.total_activities} activities`
           );
         } else {
-          errorCount++;
+          totalErrors++;
+          stats.errored++;
           errors.push({
             type: "LangGraph Send",
             code: lgResult.statusCode ?? "unknown",
@@ -276,7 +325,8 @@ export const sendContactsToLanggraphTask = schedules.task({
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        errorCount++;
+        totalErrors++;
+        stats.errored++;
         errors.push({
           type: "Processing",
           code: "exception",
@@ -292,21 +342,18 @@ export const sendContactsToLanggraphTask = schedules.task({
     // 8. Send Slack recap
     await sendSlackRecap({
       batchId,
-      totalEligible: allContactIds.length,
-      cooldownSkipped: cooldownSkipped.length,
-      tier1Count: tier1.length,
-      tier2Count: tier2.length,
-      sent: sentCount,
-      errored: errorCount,
-      remaining,
+      ownerStats: ownerStatsMap,
+      noOwnerSkipped: noOwnerSkipped.length,
+      totalSent,
+      totalErrors,
     });
 
     // 9. Send errors to script_logs
     await sendErrorToScriptLogs("Send Contacts to LangGraph", [
       {
         label: "Contacts",
-        inserted: sentCount,
-        skipped: cooldownSkipped.length,
+        inserted: totalSent,
+        skipped: noOwnerSkipped.length + [...ownerStatsMap.values()].reduce((s, o) => s + o.cooldownSkipped, 0),
         errors,
       },
     ]);
@@ -317,18 +364,36 @@ export const sendContactsToLanggraphTask = schedules.task({
       totalActivities: allActivities.length,
       filteredActivities: filtered.length,
       uniqueContacts: allContactIds.length,
-      cooldownSkipped: cooldownSkipped.length,
-      tier1: tier1.length,
-      tier2: tier2.length,
-      sent: sentCount,
-      errors: errorCount,
-      remaining,
+      noOwnerSkipped: noOwnerSkipped.length,
+      owners: Object.fromEntries(ownerStatsMap),
+      sent: totalSent,
+      errors: totalErrors,
     };
 
     logger.info("=== SUMMARY ===", summary);
     return summary;
   },
 });
+
+// ============================================
+// OWNER RESOLUTION
+// ============================================
+function getContactOwner(
+  activities: PrcActivity[]
+): { id: string; name: string } | null {
+  for (const activity of activities) {
+    const ownerData = parseJsonField(activity.OWNER_CONTACT_INTENT_HUBSPOT) as Record<string, unknown> | null;
+    if (!ownerData) continue;
+    const ownerId = ownerData.owner_hubspot_id;
+    if (ownerId) {
+      return {
+        id: String(ownerId),
+        name: (ownerData.owner_name as string) ?? String(ownerId),
+      };
+    }
+  }
+  return null;
+}
 
 // ============================================
 // ACTIVE DEAL CHECK
@@ -542,18 +607,15 @@ async function sendToLangGraph(
 // ============================================
 // SLACK RECAP
 // ============================================
-interface SlackRecapData {
+interface SlackRecapInput {
   batchId: string;
-  totalEligible: number;
-  cooldownSkipped: number;
-  tier1Count: number;
-  tier2Count: number;
-  sent: number;
-  errored: number;
-  remaining: number;
+  ownerStats: Map<string, OwnerStats>;
+  noOwnerSkipped: number;
+  totalSent: number;
+  totalErrors: number;
 }
 
-async function sendSlackRecap(data: SlackRecapData): Promise<void> {
+async function sendSlackRecap(data: SlackRecapInput): Promise<void> {
   const webhookUrl = process.env.script_logs ?? "";
   if (!webhookUrl) return;
 
@@ -561,16 +623,24 @@ async function sendSlackRecap(data: SlackRecapData): Promise<void> {
   const dateStr = now.toISOString().substring(0, 10);
   const timeStr = now.toISOString().substring(11, 16);
 
-  const status = data.errored > 0 ? "⚠️" : "✅";
+  const status = data.totalErrors > 0 ? "⚠️" : "✅";
   let message = `[Send Contacts to LangGraph] ${status} — ${dateStr} ${timeStr}\n\n`;
-  message += `📊 *Contacts*\n`;
-  message += `• ${data.totalEligible} éligibles (IA activée)\n`;
-  message += `• ${data.cooldownSkipped} skippés (décision < ${COOLDOWN_DAYS}j)\n`;
-  message += `• ${data.tier1Count} Tier 1 (deal actif) | ${data.tier2Count} Tier 2\n\n`;
-  message += `🚀 *Envois*\n`;
-  message += `• ${data.sent} envoyés / ${MAX_CONTACTS_PER_RUN} max\n`;
-  if (data.errored > 0) message += `• ${data.errored} erreurs\n`;
-  if (data.remaining > 0) message += `• ${data.remaining} en file d'attente`;
+
+  for (const [, stats] of data.ownerStats) {
+    message += `👤 *${stats.ownerName}*\n`;
+    message += `• ${stats.totalEligible} éligibles | ${stats.cooldownSkipped} cooldown (< ${COOLDOWN_DAYS}j)\n`;
+    message += `• T1 (deal actif): ${stats.tier1} | T2: ${stats.tier2}\n`;
+    message += `• ${stats.sent} envoyés / ${MAX_CONTACTS_PER_OWNER} max`;
+    if (stats.errored > 0) message += ` | ${stats.errored} erreurs`;
+    if (stats.remaining > 0) message += ` | ${stats.remaining} en attente`;
+    message += `\n\n`;
+  }
+
+  if (data.noOwnerSkipped > 0) {
+    message += `⏭️ ${data.noOwnerSkipped} contacts sans owner (skippés)\n\n`;
+  }
+
+  message += `📊 *Total*: ${data.totalSent} envoyés | ${data.totalErrors} erreurs`;
 
   try {
     await fetch(webhookUrl, {
