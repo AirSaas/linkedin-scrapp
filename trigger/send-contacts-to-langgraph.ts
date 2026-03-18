@@ -1,5 +1,5 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
-import { supabase } from "./lib/supabase.js";
+import { getAiAeSdrSupabase } from "./lib/ai-ae-sdr-supabase.js";
 import {
   sleep,
   sendErrorToScriptLogs,
@@ -207,7 +207,7 @@ async function fetchAllActivities(): Promise<PrcActivity[]> {
 
   while (true) {
     pageNumber++;
-    const { data, error } = await supabase
+    const { data, error } = await getAiAeSdrSupabase()
       .from("PRC_CONTACT_ACTIVITIES")
       .select("*")
       .range(offset, offset + PAGE_SIZE - 1);
