@@ -10,7 +10,7 @@ import {
 // CONFIGURATION
 // ============================================
 const LANGGRAPH_ASSISTANT_ID = "full_pipeline";
-const RATE_LIMIT_BETWEEN_SENDS = 2000;
+const RATE_LIMIT_BETWEEN_SENDS = 20000;
 const PAGE_SIZE = 1000;
 const MAX_CONTACTS_PER_OWNER = 15;
 const COOLDOWN_DAYS = 3;
