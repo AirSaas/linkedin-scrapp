@@ -33,7 +33,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
-- `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (ai_ae_sdr_agent Supabase `rcpcdpxqjxeikbssprdz`), builds structured JSON per contact, sends to LangGraph async /runs endpoint
+- `trigger/send-contacts-to-langgraph.ts` — daily cron: fetches PRC_CONTACT_ACTIVITIES (ai_ae_sdr_agent Supabase `rcpcdpxqjxeikbssprdz`), skips contacts with final_decision < 3 days, prioritizes active pipeline SQL deals (Tier 1) then FIFO by oldest decision, caps at 15 contacts/owner/run, sends to LangGraph async /runs endpoint
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
@@ -365,21 +365,35 @@ flowchart TD
     H -->|Success| J[Done]
 ```
 
-### `send-contacts-to-langgraph` (cron)
+### `send-contacts-to-langgraph` (daily cron)
 
 ```mermaid
 flowchart TD
-    A([Cron]) --> B[Fetch PRC_CONTACT_ACTIVITIES<br/>from ai_ae_sdr_agent Supabase — paginé par 1000]
-    B --> C[Filtrer IS_CONTACT_IA_AGENT_ACTIVATED = true]
+    A([Cron journalier]) --> B[Fetch PRC_CONTACT_ACTIVITIES<br/>from ai_ae_sdr_agent Supabase — paginé par 1000]
+    B --> C[Filtrer IS_CONTACT_IA_AGENT_ACTIVATED = true<br/>ET IS_CANCEL_AGENT_IA_ACTIVATED != true]
     C --> D[Grouper par CONTACT_HUBSPOT_ID]
-    D --> E{Pour chaque contact}
-    E --> F[Dédupliquer activités<br/>par ACTIVITY_ID]
-    F --> G[Construire JSON payload<br/>contact_info + activities + stats]
-    G --> H[POST LangGraph /runs<br/>assistant_id: full_pipeline]
-    H -->|Success| I[Log sent]
-    H -->|Error| J[Log error]
-    E -->|All done| K{{Slack: script_logs}}
-    E -->|Errors| L{{sendErrorToScriptLogs}}
+
+    D --> E[Résoudre owner par contact<br/>OWNER_CONTACT_INTENT_HUBSPOT.owner_hubspot_id]
+    E -->|Pas d'owner| F[Skip]
+
+    E --> G[Fetch final_decision<br/>created_at >= J-3]
+    G --> H{Pour chaque owner}
+    H --> I{Pour chaque contact}
+    I -->|final_decision < 3j| J[Skip: cooldown]
+    I -->|Éligible| K{Deal actif<br/>pipeline SQL ?}
+    K -->|Oui| L[Tier 1]
+    K -->|Non| M[Tier 2]
+
+    L & M --> N[Trier par ancienneté<br/>dernière final_decision<br/>jamais traité = priorité max]
+    N --> O[Prendre max 15 contacts/owner]
+
+    O --> P{Pour chaque contact}
+    P --> Q[Construire JSON payload<br/>contact_info + activities + stats]
+    Q --> R[POST LangGraph /runs<br/>assistant_id: full_pipeline]
+    R -->|Success| S[Log sent]
+    R -->|Error| T[Log error]
+    P -->|All done| U{{Slack: script_logs<br/>recap par owner}}
+    P -->|Errors| V{{sendErrorToScriptLogs}}
 ```
 
 ### `batch-crisp-to-supabase` (manual)
@@ -713,6 +727,17 @@ flowchart TD
 - `transcript_clean`: formatted transcript with speaker names and timestamps
 - `topics`, `tags`: string arrays
 - `raw_data`: full Modjo API response
+
+### `final_decision`
+- **Supabase project**: `rcpcdpxqjxeikbssprdz` (ai_ae_sdr_agent) — read via `AI_AE_SDR_SUPABASE_URL`/`AI_AE_SDR_SUPABASE_KEY`
+- LangGraph agent output: recommendations per contact
+- PK: `id` (serial)
+- `contact_hubspot_id`: HubSpot contact ID
+- `session_id`: LangGraph session ID
+- `decision`: JSON string (action, message, sequence_plan, risk_factors, evidence_trail...)
+- `created_at`: timestamp of recommendation
+- `user_slack_message`, `type_of_validation`: user feedback fields
+- Used by `send-contacts-to-langgraph` for cooldown check (skip if decision < 3 days)
 
 ### `PRC_CONTACT_ACTIVITIES`
 - **Supabase project**: `rcpcdpxqjxeikbssprdz` (ai_ae_sdr_agent) — read via `AI_AE_SDR_SUPABASE_URL`/`AI_AE_SDR_SUPABASE_KEY`

@@ -12,6 +12,27 @@ import {
 const LANGGRAPH_ASSISTANT_ID = "full_pipeline";
 const RATE_LIMIT_BETWEEN_SENDS = 2000;
 const PAGE_SIZE = 1000;
+const MAX_CONTACTS_PER_OWNER = 15;
+const COOLDOWN_DAYS = 3;
+
+// Pipeline SQL active deal stages — contacts with at least one of these
+// are prioritized (Tier 1) over contacts without active deals (Tier 2)
+const ACTIVE_DEAL_STAGES = new Set([
+  "Démo Airsaas",
+  "Rendez-vous a planifier",
+  "N-1 Champion paradigme in process",
+  "Executive à attraper avec le champion",
+  "1-1 Executive attrapé",
+  "1-1 Executive attrapé ",
+  "Go Meeting Pro2LT Avant vente",
+  "1-1 Executive Debrief",
+  "ABM pour attraper l'executive",
+  "No Show - retry",
+  "Présentation Equipe planifié",
+  "Go Meeting Pro2LT Vente",
+  "Présentation planning accompagnement",
+  "GO !",
+]);
 
 // ============================================
 // TYPES
@@ -86,6 +107,18 @@ interface ContactPayload {
   };
 }
 
+interface OwnerStats {
+  ownerName: string;
+  totalEligible: number;
+  cooldownSkipped: number;
+  noOwnerSkipped?: boolean;
+  tier1: number;
+  tier2: number;
+  sent: number;
+  errored: number;
+  remaining: number;
+}
+
 // ============================================
 // SCHEDULED TASK
 // ============================================
@@ -97,6 +130,7 @@ export const sendContactsToLanggraphTask = schedules.task({
 
     const batchId = new Date().toISOString().substring(0, 19);
     const errors: TaskError[] = [];
+    const sb = getAiAeSdrSupabase();
 
     // 1. Fetch all activities from PRC_CONTACT_ACTIVITIES
     logger.info("Fetching PRC_CONTACT_ACTIVITIES...");
@@ -125,27 +159,162 @@ export const sendContactsToLanggraphTask = schedules.task({
       if (!grouped[contactId]) grouped[contactId] = [];
       grouped[contactId].push(activity);
     }
-    const contactIds = Object.keys(grouped);
-    logger.info(`${contactIds.length} unique contacts`);
+    const allContactIds = Object.keys(grouped);
+    logger.info(`${allContactIds.length} unique contacts`);
 
-    // 4. Send each contact to LangGraph
-    let sentCount = 0;
-    let errorCount = 0;
+    // 4. Resolve owner for each contact (from OWNER_CONTACT_INTENT_HUBSPOT.owner_hubspot_id)
+    const contactOwnerMap = new Map<string, { id: string; name: string }>();
+    const noOwnerSkipped: string[] = [];
 
-    for (const contactId of contactIds) {
+    for (const contactId of allContactIds) {
+      const owner = getContactOwner(grouped[contactId]);
+      if (owner) {
+        contactOwnerMap.set(contactId, owner);
+      } else {
+        noOwnerSkipped.push(contactId);
+      }
+    }
+
+    logger.info(
+      `${contactOwnerMap.size} contacts with owner | ${noOwnerSkipped.length} skipped (no owner)`
+    );
+
+    // 5. Fetch recent final_decisions (last COOLDOWN_DAYS days) for cooldown
+    const cooldownDate = new Date(
+      Date.now() - COOLDOWN_DAYS * 24 * 60 * 60 * 1000
+    ).toISOString();
+
+    const { data: recentDecisions, error: fdError } = await sb
+      .from("final_decision")
+      .select("contact_hubspot_id, created_at")
+      .gte("created_at", cooldownDate);
+
+    if (fdError) {
+      throw new Error(`Failed to fetch final_decision: ${fdError.message}`);
+    }
+
+    const recentDecisionSet = new Set<string>();
+    for (const row of recentDecisions ?? []) {
+      if (row.contact_hubspot_id) recentDecisionSet.add(row.contact_hubspot_id);
+    }
+
+    // Fetch ALL final_decisions for prioritization (oldest decision first)
+    const { data: allDecisions, error: allFdError } = await sb
+      .from("final_decision")
+      .select("contact_hubspot_id, created_at");
+
+    if (allFdError) {
+      throw new Error(
+        `Failed to fetch all final_decisions: ${allFdError.message}`
+      );
+    }
+
+    const allLastDecisionMap = new Map<string, string>();
+    for (const row of allDecisions ?? []) {
+      const cid = row.contact_hubspot_id;
+      if (!cid) continue;
+      const existing = allLastDecisionMap.get(cid);
+      if (!existing || row.created_at > existing) {
+        allLastDecisionMap.set(cid, row.created_at);
+      }
+    }
+
+    // 6. Group contacts by owner, then apply cooldown + prioritization per owner
+    const ownerContacts = new Map<string, { name: string; contactIds: string[] }>();
+
+    for (const [contactId, owner] of contactOwnerMap) {
+      let entry = ownerContacts.get(owner.id);
+      if (!entry) {
+        entry = { name: owner.name, contactIds: [] };
+        ownerContacts.set(owner.id, entry);
+      }
+      entry.contactIds.push(contactId);
+    }
+
+    const ownerStatsMap = new Map<string, OwnerStats>();
+    const toSendAll: { contactId: string; ownerId: string }[] = [];
+
+    for (const [ownerId, { name: ownerName, contactIds }] of ownerContacts) {
+      const cooldownSkipped: string[] = [];
+      const eligible: string[] = [];
+
+      for (const contactId of contactIds) {
+        if (recentDecisionSet.has(contactId)) {
+          cooldownSkipped.push(contactId);
+        } else {
+          eligible.push(contactId);
+        }
+      }
+
+      // Prioritize: Tier 1 (active deal) > Tier 2, then FIFO by oldest decision
+      const tier1: string[] = [];
+      const tier2: string[] = [];
+
+      for (const contactId of eligible) {
+        if (hasActiveDeal(grouped[contactId])) {
+          tier1.push(contactId);
+        } else {
+          tier2.push(contactId);
+        }
+      }
+
+      const sortByDecisionAge = (a: string, b: string) => {
+        const aDate = allLastDecisionMap.get(a);
+        const bDate = allLastDecisionMap.get(b);
+        if (!aDate && bDate) return -1;
+        if (aDate && !bDate) return 1;
+        if (!aDate && !bDate) return 0;
+        return aDate! < bDate! ? -1 : aDate! > bDate! ? 1 : 0;
+      };
+
+      tier1.sort(sortByDecisionAge);
+      tier2.sort(sortByDecisionAge);
+
+      const prioritized = [...tier1, ...tier2];
+      const toSend = prioritized.slice(0, MAX_CONTACTS_PER_OWNER);
+      const remaining = prioritized.length - toSend.length;
+
+      for (const contactId of toSend) {
+        toSendAll.push({ contactId, ownerId });
+      }
+
+      ownerStatsMap.set(ownerId, {
+        ownerName,
+        totalEligible: contactIds.length,
+        cooldownSkipped: cooldownSkipped.length,
+        tier1: tier1.length,
+        tier2: tier2.length,
+        sent: 0, // updated after sending
+        errored: 0,
+        remaining,
+      });
+
+      logger.info(
+        `[${ownerName}] ${eligible.length} eligible (${cooldownSkipped.length} cooldown) | T1: ${tier1.length} T2: ${tier2.length} | Sending: ${toSend.length} | Remaining: ${remaining}`
+      );
+    }
+
+    // 7. Send each contact to LangGraph
+    let totalSent = 0;
+    let totalErrors = 0;
+
+    for (const { contactId, ownerId } of toSendAll) {
       const activities = grouped[contactId];
+      const stats = ownerStatsMap.get(ownerId)!;
 
       try {
         const payload = buildContactPayload(contactId, activities);
         const lgResult = await sendToLangGraph(payload);
 
         if (lgResult.success) {
-          sentCount++;
+          totalSent++;
+          stats.sent++;
           logger.info(
-            `Sent ${contactId} (${payload.contact_info.full_name}) — ${payload.stats.total_activities} activities`
+            `[${stats.ownerName}] Sent ${contactId} (${payload.contact_info.full_name}) — ${payload.stats.total_activities} activities`
           );
         } else {
-          errorCount++;
+          totalErrors++;
+          stats.errored++;
           errors.push({
             type: "LangGraph Send",
             code: lgResult.statusCode ?? "unknown",
@@ -156,7 +325,8 @@ export const sendContactsToLanggraphTask = schedules.task({
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        errorCount++;
+        totalErrors++;
+        stats.errored++;
         errors.push({
           type: "Processing",
           code: "exception",
@@ -169,15 +339,21 @@ export const sendContactsToLanggraphTask = schedules.task({
       await sleep(RATE_LIMIT_BETWEEN_SENDS);
     }
 
-    // 5. Send Slack recap
-    await sendSlackRecap(batchId, contactIds.length, sentCount, errorCount);
+    // 8. Send Slack recap
+    await sendSlackRecap({
+      batchId,
+      ownerStats: ownerStatsMap,
+      noOwnerSkipped: noOwnerSkipped.length,
+      totalSent,
+      totalErrors,
+    });
 
-    // 6. Send errors to script_logs
+    // 9. Send errors to script_logs
     await sendErrorToScriptLogs("Send Contacts to LangGraph", [
       {
         label: "Contacts",
-        inserted: sentCount,
-        skipped: contactIds.length - sentCount - errorCount,
+        inserted: totalSent,
+        skipped: noOwnerSkipped.length + [...ownerStatsMap.values()].reduce((s, o) => s + o.cooldownSkipped, 0),
         errors,
       },
     ]);
@@ -187,15 +363,53 @@ export const sendContactsToLanggraphTask = schedules.task({
       batchId,
       totalActivities: allActivities.length,
       filteredActivities: filtered.length,
-      uniqueContacts: contactIds.length,
-      sent: sentCount,
-      errors: errorCount,
+      uniqueContacts: allContactIds.length,
+      noOwnerSkipped: noOwnerSkipped.length,
+      owners: Object.fromEntries(ownerStatsMap),
+      sent: totalSent,
+      errors: totalErrors,
     };
 
     logger.info("=== SUMMARY ===", summary);
     return summary;
   },
 });
+
+// ============================================
+// OWNER RESOLUTION
+// ============================================
+function getContactOwner(
+  activities: PrcActivity[]
+): { id: string; name: string } | null {
+  for (const activity of activities) {
+    const ownerData = parseJsonField(activity.OWNER_CONTACT_INTENT_HUBSPOT) as Record<string, unknown> | null;
+    if (!ownerData) continue;
+    const ownerId = ownerData.owner_hubspot_id;
+    if (ownerId) {
+      return {
+        id: String(ownerId),
+        name: (ownerData.owner_name as string) ?? String(ownerId),
+      };
+    }
+  }
+  return null;
+}
+
+// ============================================
+// ACTIVE DEAL CHECK
+// ============================================
+function hasActiveDeal(activities: PrcActivity[]): boolean {
+  for (const activity of activities) {
+    const deals = parseJsonField(activity.DEALS) as Deal[] | null;
+    if (!Array.isArray(deals)) continue;
+    for (const deal of deals) {
+      if (deal.deal_stage && ACTIVE_DEAL_STAGES.has(deal.deal_stage.trim())) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 // ============================================
 // SUPABASE FETCH (SOURCE)
@@ -393,12 +607,15 @@ async function sendToLangGraph(
 // ============================================
 // SLACK RECAP
 // ============================================
-async function sendSlackRecap(
-  batchId: string,
-  totalContacts: number,
-  sent: number,
-  errored: number
-): Promise<void> {
+interface SlackRecapInput {
+  batchId: string;
+  ownerStats: Map<string, OwnerStats>;
+  noOwnerSkipped: number;
+  totalSent: number;
+  totalErrors: number;
+}
+
+async function sendSlackRecap(data: SlackRecapInput): Promise<void> {
   const webhookUrl = process.env.script_logs ?? "";
   if (!webhookUrl) return;
 
@@ -406,10 +623,24 @@ async function sendSlackRecap(
   const dateStr = now.toISOString().substring(0, 10);
   const timeStr = now.toISOString().substring(11, 16);
 
-  const status = errored > 0 ? "⚠️" : "✅";
-  let message = `[Send Contacts to LangGraph — Trigger.dev] ${status} — ${dateStr} ${timeStr}\n`;
-  message += `Batch: ${batchId}\n`;
-  message += `• ${totalContacts} contacts | ${sent} envoyés | ${errored} erreurs`;
+  const status = data.totalErrors > 0 ? "⚠️" : "✅";
+  let message = `[Send Contacts to LangGraph] ${status} — ${dateStr} ${timeStr}\n\n`;
+
+  for (const [, stats] of data.ownerStats) {
+    message += `👤 *${stats.ownerName}*\n`;
+    message += `• ${stats.totalEligible} éligibles | ${stats.cooldownSkipped} cooldown (< ${COOLDOWN_DAYS}j)\n`;
+    message += `• T1 (deal actif): ${stats.tier1} | T2: ${stats.tier2}\n`;
+    message += `• ${stats.sent} envoyés / ${MAX_CONTACTS_PER_OWNER} max`;
+    if (stats.errored > 0) message += ` | ${stats.errored} erreurs`;
+    if (stats.remaining > 0) message += ` | ${stats.remaining} en attente`;
+    message += `\n\n`;
+  }
+
+  if (data.noOwnerSkipped > 0) {
+    message += `⏭️ ${data.noOwnerSkipped} contacts sans owner (skippés)\n\n`;
+  }
+
+  message += `📊 *Total*: ${data.totalSent} envoyés | ${data.totalErrors} erreurs`;
 
   try {
     await fetch(webhookUrl, {
