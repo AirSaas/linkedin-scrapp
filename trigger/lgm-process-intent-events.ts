@@ -22,8 +22,9 @@ const MIN_EMPLOYEES_FOR_HUBSPOT = 500;
 // Slack channels dédiés par sales (intent owner name → channel ID)
 // Used by sendSlackIaNotification to route interactive activation messages
 const SLACK_IA_CHANNELS: Record<string, string> = {
-  "Thomas Doret": "C0A76PH8K09",
-  "Bertran Ruiz": "C0AB8RV58Q6",
+  "thomas_poitau": "C0A76PH8K09",
+  "bertran_ruiz": "C0AB8RV58Q6",
+  "simon_vacher": "C0AMQJW0E1F",
 };
 
 const EXCLUDED_LINKEDIN_PROFILES = [
@@ -1185,7 +1186,7 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
                 shouldSendSlack = true;
               } else {
                 // Step 3: Send Slack interactive notification
-                const slackChannelId = SLACK_IA_CHANNELS[intentOwner ?? ""];
+                const slackChannelId = SLACK_IA_CHANNELS[normalizeOwner(intentOwner)];
                 if (slackChannelId) {
                   const companySizeStr = String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?");
                   const notifResult = await sendSlackIaNotification({
@@ -1249,7 +1250,7 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             shouldSendSlack = false;
           } else {
             // Send Slack interactive notification instead of auto-activating
-            const slackChannelId = SLACK_IA_CHANNELS[intentOwner ?? ""];
+            const slackChannelId = SLACK_IA_CHANNELS[normalizeOwner(intentOwner)];
             if (slackChannelId) {
               const companySizeStr = String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?");
               const notifResult = await sendSlackIaNotification({
