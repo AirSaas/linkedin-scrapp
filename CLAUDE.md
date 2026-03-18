@@ -33,7 +33,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
-- `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (airsaas Supabase), builds structured JSON per contact, sends to LangGraph async /runs endpoint
+- `trigger/send-contacts-to-langgraph.ts` — fetches PRC_CONTACT_ACTIVITIES (ai_ae_sdr_agent Supabase `rcpcdpxqjxeikbssprdz`), builds structured JSON per contact, sends to LangGraph async /runs endpoint
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
@@ -369,7 +369,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([Cron]) --> B[Fetch PRC_CONTACT_ACTIVITIES<br/>from airsaas Supabase — paginé par 1000]
+    A([Cron]) --> B[Fetch PRC_CONTACT_ACTIVITIES<br/>from ai_ae_sdr_agent Supabase — paginé par 1000]
     B --> C[Filtrer IS_CONTACT_IA_AGENT_ACTIVATED = true]
     C --> D[Grouper par CONTACT_HUBSPOT_ID]
     D --> E{Pour chaque contact}
@@ -715,9 +715,9 @@ flowchart TD
 - `raw_data`: full Modjo API response
 
 ### `PRC_CONTACT_ACTIVITIES`
-- **Supabase project**: `ybgckyywiobxfsyvddtx` (airsaas) — read via `SUPABASE_URL`/`SUPABASE_KEY`
+- **Supabase project**: `rcpcdpxqjxeikbssprdz` (ai_ae_sdr_agent) — read via `AI_AE_SDR_SUPABASE_URL`/`AI_AE_SDR_SUPABASE_KEY`
 - Contact activities synced via Airbyte, read-only
-- Fields: `CONTACT_HUBSPOT_ID`, `CONTACT_FULL_NAME`, `CONTACT` (JSON), `DEALS` (JSON), `OWNER_INTENT_HUBSPOT` (JSON), `OWNER_CONTACT_INTENT_HUBSPOT` (JSON), `SENDER` (JSON), `ACTIVITY_ID`, `ACTIVITY_TYPE`, `ACTIVITY_RECORDED_ON`, `ACTIVITY_DIRECTION`, `ACTIVITY_METADATA` (JSON), `IS_CONTACT_IA_AGENT_ACTIVATED`, `_airbyte_generation_id`
+- Fields: `CONTACT_HUBSPOT_ID`, `CONTACT_FULL_NAME`, `CONTACT` (JSON), `DEALS` (JSON), `OWNER_INTENT_HUBSPOT` (JSON), `OWNER_CONTACT_INTENT_HUBSPOT` (JSON), `SENDER` (JSON), `ACTIVITY_ID`, `ACTIVITY_TYPE`, `ACTIVITY_RECORDED_ON`, `ACTIVITY_DIRECTION`, `ACTIVITY_METADATA` (JSON), `IS_CONTACT_IA_AGENT_ACTIVATED`, `IS_CANCEL_AGENT_IA_ACTIVATED`, `_airbyte_generation_id`
 - Used by `send-contacts-to-langgraph`
 
 ### `tchat_conversations`
