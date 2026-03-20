@@ -1046,6 +1046,22 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
   const unmappedKeys: UnmappedKeyDetail[] = [];
   const processedEvents: ProcessedEvent[] = [];
 
+  // Accumulate Slack IA notifications to deduplicate by contact (multiple events → 1 notif)
+  const pendingSlackNotifs = new Map<string, {
+    contactName: string;
+    contactJob: string;
+    companyName: string;
+    linkedinUrl: string;
+    hubspotContactId: string;
+    intentOwner: string;
+    companySize: string;
+    eventTypes: string[];
+    channelId: string;
+    record: IntentEvent; // keep first record for log base
+  }>();
+  // Track contacts already assigned an owner (avoid duplicate PATCH)
+  const assignedOwnerContacts = new Set<string>();
+
   for (const record of events) {
     const fullName =
       `${record.CONTACT_FIRST_NAME ?? ""} ${record.CONTACT_LAST_NAME ?? ""}`.trim();
@@ -1160,24 +1176,32 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
         const intentOwner = record.INTENT_OWNER;
 
         if (!businessOwner) {
-          // Cas 1: BUSINESS_OWNER is null → assign owner immediately, then Slack notif for activation
+          // Cas 1: BUSINESS_OWNER is null → assign owner immediately, then queue Slack notif for activation
           const intentOwnerHubspotId = getHubspotIdForIntentOwner(intentOwner, teamMembers);
           if (intentOwnerHubspotId) {
-            // Step 1: Assign owner only (no activation)
-            const assignResult = await assignHubspotOwnerOnly(
-              contactHubspotId,
-              intentOwnerHubspotId
-            );
-            logRoutingDecision({
-              ...logBase, destination: "HUBSPOT_ASSIGN",
-              hubspot_contact_id: contactHubspotId, hubspot_success: assignResult.success,
-            });
+            // Step 1: Assign owner only (skip if already assigned for this contact in this run)
+            if (!assignedOwnerContacts.has(contactHubspotId)) {
+              const assignResult = await assignHubspotOwnerOnly(
+                contactHubspotId,
+                intentOwnerHubspotId
+              );
+              logRoutingDecision({
+                ...logBase, destination: "HUBSPOT_ASSIGN",
+                hubspot_contact_id: contactHubspotId, hubspot_success: assignResult.success,
+              });
+              if (!assignResult.success) {
+                hubspotFailed++;
+                shouldSendSlack = false;
+                processedEvents.push({ record, action, shouldSendSlack });
+                processed++;
+                await sleep(RATE_LIMIT.PAUSE_BETWEEN_EVENTS);
+                continue;
+              }
+              assignedOwnerContacts.add(contactHubspotId);
+            }
 
-            if (!assignResult.success) {
-              hubspotFailed++;
-              shouldSendSlack = false;
-            } else {
-              // Step 2: Check cancel before sending notification
+            // Step 2: Check cancel before queuing notification (only on first occurrence)
+            if (!pendingSlackNotifs.has(contactHubspotId)) {
               const cancelResult = await getHubspotContactCancelStatus(contactHubspotId);
               if (cancelResult.success && cancelResult.cancelValue !== null &&
                   cancelResult.cancelValue !== "" && cancelResult.cancelValue !== undefined) {
@@ -1185,33 +1209,38 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
                 hubspotSuccess++;
                 shouldSendSlack = true;
               } else {
-                // Step 3: Send Slack interactive notification
+                // Step 3: Queue Slack notification (will be sent after loop, merged by contact)
                 const slackChannelId = SLACK_IA_CHANNELS[normalizeOwner(intentOwner)];
                 if (slackChannelId) {
-                  const companySizeStr = String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?");
-                  const notifResult = await sendSlackIaNotification({
-                    channelId: slackChannelId,
+                  pendingSlackNotifs.set(contactHubspotId, {
                     contactName: fullName,
                     contactJob: record.CONTACT_JOB ?? "",
                     companyName: record.COMPANY_NAME ?? "",
                     linkedinUrl: record.CONTACT_LINKEDIN_PROFILE_URL ?? "",
                     hubspotContactId: contactHubspotId,
-                    intentEventType: record.INTENT_EVENT_TYPE ?? "",
                     intentOwner: intentOwner ?? "",
-                    companySize: companySizeStr,
-                  });
-                  logRoutingDecision({
-                    ...logBase, destination: "SLACK_NOTIF_SENT",
-                    hubspot_contact_id: contactHubspotId, hubspot_success: notifResult.success,
+                    companySize: String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?"),
+                    eventTypes: [record.INTENT_EVENT_TYPE ?? ""],
+                    channelId: slackChannelId,
+                    record,
                   });
                   hubspotSuccess++;
-                  shouldSendSlack = notifResult.success;
+                  shouldSendSlack = true;
                 } else {
                   logger.warn(`No Slack channel configured for intent owner: ${intentOwner}`);
                   hubspotSuccess++;
                   shouldSendSlack = true;
                 }
               }
+            } else {
+              // Already queued for this contact → merge event type
+              const pending = pendingSlackNotifs.get(contactHubspotId)!;
+              const eventType = record.INTENT_EVENT_TYPE ?? "";
+              if (eventType && !pending.eventTypes.includes(eventType)) {
+                pending.eventTypes.push(eventType);
+              }
+              hubspotSuccess++;
+              shouldSendSlack = true;
             }
           } else {
             logger.warn(`No HubSpot ID found for intent owner: ${intentOwner}`);
@@ -1223,62 +1252,66 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             shouldSendSlack = false;
           }
         } else if (businessOwner === intentOwner) {
-          // Cas 2: BUSINESS_OWNER = INTENT_OWNER → check cancel, then Slack notif for activation
-          const getResult =
-            await getHubspotContactCancelStatus(contactHubspotId);
+          // Cas 2: BUSINESS_OWNER = INTENT_OWNER → check cancel, then queue Slack notif for activation
+          // Only check cancel on first occurrence for this contact
+          if (!pendingSlackNotifs.has(contactHubspotId)) {
+            const getResult =
+              await getHubspotContactCancelStatus(contactHubspotId);
 
-          if (!getResult.success) {
-            logRoutingDecision({
-              ...logBase, destination: "HUBSPOT_ACTIVATE",
-              hubspot_contact_id: contactHubspotId, hubspot_success: false,
-            });
-            hubspotFailed++;
-            shouldSendSlack = false;
-          } else if (
-            getResult.cancelValue !== null &&
-            getResult.cancelValue !== "" &&
-            getResult.cancelValue !== undefined
-          ) {
-            logger.info(
-              `HubSpot skip - cancel_agent_ia_activated non-empty for ${fullName}`
-            );
-            logRoutingDecision({
-              ...logBase, destination: "SKIPPED", skip_reason: "cancel_agent_ia",
-              hubspot_contact_id: contactHubspotId,
-            });
-            hubspotSkipped++;
-            shouldSendSlack = false;
-          } else {
-            // Send Slack interactive notification instead of auto-activating
-            const slackChannelId = SLACK_IA_CHANNELS[normalizeOwner(intentOwner)];
-            if (slackChannelId) {
-              const companySizeStr = String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?");
-              const notifResult = await sendSlackIaNotification({
-                channelId: slackChannelId,
-                contactName: fullName,
-                contactJob: record.CONTACT_JOB ?? "",
-                companyName: record.COMPANY_NAME ?? "",
-                linkedinUrl: record.CONTACT_LINKEDIN_PROFILE_URL ?? "",
-                hubspotContactId: contactHubspotId,
-                intentEventType: record.INTENT_EVENT_TYPE ?? "",
-                intentOwner: intentOwner ?? "",
-                companySize: companySizeStr,
-              });
+            if (!getResult.success) {
               logRoutingDecision({
-                ...logBase, destination: "SLACK_NOTIF_SENT",
-                hubspot_contact_id: contactHubspotId, hubspot_success: notifResult.success,
+                ...logBase, destination: "HUBSPOT_ACTIVATE",
+                hubspot_contact_id: contactHubspotId, hubspot_success: false,
               });
-              if (notifResult.success) {
-                hubspotSuccess++;
-              } else {
-                hubspotFailed++;
-              }
-              shouldSendSlack = notifResult.success;
+              hubspotFailed++;
+              shouldSendSlack = false;
+            } else if (
+              getResult.cancelValue !== null &&
+              getResult.cancelValue !== "" &&
+              getResult.cancelValue !== undefined
+            ) {
+              logger.info(
+                `HubSpot skip - cancel_agent_ia_activated non-empty for ${fullName}`
+              );
+              logRoutingDecision({
+                ...logBase, destination: "SKIPPED", skip_reason: "cancel_agent_ia",
+                hubspot_contact_id: contactHubspotId,
+              });
+              hubspotSkipped++;
+              shouldSendSlack = false;
             } else {
-              logger.warn(`No Slack channel configured for intent owner: ${intentOwner}`);
-              hubspotSuccess++;
-              shouldSendSlack = true;
+              // Queue Slack notification (will be sent after loop, merged by contact)
+              const slackChannelId = SLACK_IA_CHANNELS[normalizeOwner(intentOwner)];
+              if (slackChannelId) {
+                pendingSlackNotifs.set(contactHubspotId, {
+                  contactName: fullName,
+                  contactJob: record.CONTACT_JOB ?? "",
+                  companyName: record.COMPANY_NAME ?? "",
+                  linkedinUrl: record.CONTACT_LINKEDIN_PROFILE_URL ?? "",
+                  hubspotContactId: contactHubspotId,
+                  intentOwner: intentOwner ?? "",
+                  companySize: String(record.COMPANY_APPROX_EMPLOYEE_NB ?? record.COMPANY_SIZE_RANGE ?? "?"),
+                  eventTypes: [record.INTENT_EVENT_TYPE ?? ""],
+                  channelId: slackChannelId,
+                  record,
+                });
+                hubspotSuccess++;
+                shouldSendSlack = true;
+              } else {
+                logger.warn(`No Slack channel configured for intent owner: ${intentOwner}`);
+                hubspotSuccess++;
+                shouldSendSlack = true;
+              }
             }
+          } else {
+            // Already queued for this contact → merge event type
+            const pending = pendingSlackNotifs.get(contactHubspotId)!;
+            const eventType = record.INTENT_EVENT_TYPE ?? "";
+            if (eventType && !pending.eventTypes.includes(eventType)) {
+              pending.eventTypes.push(eventType);
+            }
+            hubspotSuccess++;
+            shouldSendSlack = true;
           }
         } else {
           // Cas 3: BUSINESS_OWNER ≠ INTENT_OWNER → skip for now
@@ -1323,10 +1356,57 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
     await sleep(RATE_LIMIT.PAUSE_BETWEEN_EVENTS);
   }
 
+  // --- Send accumulated Slack IA notifications (1 per contact, merged event types) ---
+  let slackNotifSent = 0;
+  let slackNotifFailed = 0;
+  for (const [hubspotId, notif] of pendingSlackNotifs) {
+    const mergedEventTypes = notif.eventTypes.join(" + ");
+    logger.info(`Sending Slack IA notif for ${notif.contactName} (${mergedEventTypes})`);
+
+    const notifResult = await sendSlackIaNotification({
+      channelId: notif.channelId,
+      contactName: notif.contactName,
+      contactJob: notif.contactJob,
+      companyName: notif.companyName,
+      linkedinUrl: notif.linkedinUrl,
+      hubspotContactId: notif.hubspotContactId,
+      intentEventType: mergedEventTypes,
+      intentOwner: notif.intentOwner,
+      companySize: notif.companySize,
+    });
+
+    const logBase = {
+      linkedin_url: notif.record.CONTACT_LINKEDIN_PROFILE_URL,
+      first_name: notif.record.CONTACT_FIRST_NAME,
+      last_name: notif.record.CONTACT_LAST_NAME,
+      company: notif.record.COMPANY_NAME,
+      source: "intent_event" as const,
+      connected_with_intent_owner: notif.record.CONNECTED_WITH_INTENT_OWNER,
+      intent_owner: notif.record.INTENT_OWNER,
+      event_type: mergedEventTypes,
+      business_owner: notif.record.BUSINESS_OWNER,
+      task_id: "lgm-process-intent-events",
+    };
+
+    logRoutingDecision({
+      ...logBase, destination: "SLACK_NOTIF_SENT",
+      hubspot_contact_id: hubspotId, hubspot_success: notifResult.success,
+    });
+
+    if (notifResult.success) {
+      slackNotifSent++;
+    } else {
+      slackNotifFailed++;
+    }
+
+    await sleep(RATE_LIMIT.PAUSE_BETWEEN_API_CALLS);
+  }
+
   logger.info(
     `Intent Events done: ${processed} processed, ${excluded} excluded, ` +
       `LGM ${lgmSuccess}/${lgmFailed}/${lgmSkipped}, ` +
-      `HubSpot ${hubspotSuccess}/${hubspotFailed}/${hubspotSkipped}`
+      `HubSpot ${hubspotSuccess}/${hubspotFailed}/${hubspotSkipped}, ` +
+      `Slack notifs ${slackNotifSent}/${slackNotifFailed}`
   );
 
   return {
