@@ -73,6 +73,7 @@ interface ContactPayload {
     name: string | null;
     job: string | null;
     job_strategic_role: string | null;
+    email: string | null;
     phone: string | null;
     location: string | null;
     company: string | null;
@@ -232,7 +233,7 @@ export const sendContactsToLanggraphTask = schedules.task({
     }
 
     const ownerStatsMap = new Map<string, OwnerStats>();
-    const toSendAll: { contactId: string; ownerId: string }[] = [];
+    const toSendAll: { contactId: string; ownerId: string; tier: 1 | 2 }[] = [];
 
     for (const [ownerId, { name: ownerName, contactIds }] of ownerContacts) {
       const cooldownSkipped: string[] = [];
@@ -270,12 +271,15 @@ export const sendContactsToLanggraphTask = schedules.task({
       tier1.sort(sortByDecisionAge);
       tier2.sort(sortByDecisionAge);
 
-      const prioritized = [...tier1, ...tier2];
+      const prioritized = [
+        ...tier1.map((id) => ({ id, tier: 1 as const })),
+        ...tier2.map((id) => ({ id, tier: 2 as const })),
+      ];
       const toSend = prioritized.slice(0, MAX_CONTACTS_PER_OWNER);
       const remaining = prioritized.length - toSend.length;
 
-      for (const contactId of toSend) {
-        toSendAll.push({ contactId, ownerId });
+      for (const { id: contactId, tier } of toSend) {
+        toSendAll.push({ contactId, ownerId, tier });
       }
 
       ownerStatsMap.set(ownerId, {
@@ -298,9 +302,10 @@ export const sendContactsToLanggraphTask = schedules.task({
     let totalSent = 0;
     let totalErrors = 0;
 
-    for (const { contactId, ownerId } of toSendAll) {
+    for (const { contactId, ownerId, tier } of toSendAll) {
       const activities = grouped[contactId];
       const stats = ownerStatsMap.get(ownerId)!;
+      const owner = contactOwnerMap.get(contactId)!;
 
       try {
         const payload = buildContactPayload(contactId, activities);
@@ -312,6 +317,12 @@ export const sendContactsToLanggraphTask = schedules.task({
           logger.info(
             `[${stats.ownerName}] Sent ${contactId} (${payload.contact_info.full_name}) — ${payload.stats.total_activities} activities`
           );
+          await logSend(sb, {
+            runId: batchId, contactId, payload, tier,
+            ownerHubspotId: owner.id, ownerName: owner.name,
+            status: "success", langgraphRunId: lgResult.runId ?? null,
+            errorMessage: null,
+          });
         } else {
           totalErrors++;
           stats.errored++;
@@ -322,6 +333,12 @@ export const sendContactsToLanggraphTask = schedules.task({
             profile: contactId,
           });
           logger.error(`LangGraph error for ${contactId}: ${lgResult.error}`);
+          await logSend(sb, {
+            runId: batchId, contactId, payload, tier,
+            ownerHubspotId: owner.id, ownerName: owner.name,
+            status: "error", langgraphRunId: null,
+            errorMessage: lgResult.error ?? "unknown error",
+          });
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -498,6 +515,7 @@ function buildContactPayload(
       job: (contactData.contact_job as string) ?? null,
       job_strategic_role:
         (contactData.contact_job_strategic_role as string) ?? null,
+      email: (contactData.contact_email as string) ?? null,
       phone: (contactData.contact_consolidated_phone as string) ?? null,
       location: (contactData.contact_minimal_street as string) ?? null,
       company: (contactData.company_name as string) ?? null,
@@ -601,6 +619,51 @@ async function sendToLangGraph(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { success: false, error: msg };
+  }
+}
+
+// ============================================
+// SUPABASE LOGGING
+// ============================================
+interface LogSendParams {
+  runId: string;
+  contactId: string;
+  payload: ContactPayload;
+  tier: 1 | 2;
+  ownerHubspotId: string;
+  ownerName: string;
+  status: "success" | "error";
+  langgraphRunId: string | null;
+  errorMessage: string | null;
+}
+
+async function logSend(
+  sb: ReturnType<typeof getAiAeSdrSupabase>,
+  params: LogSendParams
+): Promise<void> {
+  try {
+    const { error } = await sb.from("langgraph_send_log").insert({
+      run_id: params.runId,
+      contact_hubspot_id: params.contactId,
+      contact_full_name: params.payload.contact_info.full_name,
+      contact_email: params.payload.contact_info.email,
+      contact_phone: params.payload.contact_info.phone,
+      contact_linkedin_url: params.payload.contact_info.linkedin_url,
+      contact_company: params.payload.contact_info.company,
+      owner_hubspot_id: params.ownerHubspotId,
+      owner_name: params.ownerName,
+      tier: params.tier,
+      total_activities: params.payload.stats.total_activities,
+      langgraph_run_id: params.langgraphRunId,
+      status: params.status,
+      error_message: params.errorMessage,
+      payload: params.payload,
+    });
+    if (error) {
+      logger.error(`Failed to log send for ${params.contactId}: ${error.message}`);
+    }
+  } catch (err) {
+    logger.error(`Exception logging send for ${params.contactId}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

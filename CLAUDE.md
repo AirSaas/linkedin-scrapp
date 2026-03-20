@@ -390,9 +390,9 @@ flowchart TD
     O --> P{Pour chaque contact}
     P --> Q[Construire JSON payload<br/>contact_info + activities + stats]
     Q --> R[POST LangGraph /runs<br/>assistant_id: full_pipeline]
-    R -->|Success| S[Log sent]
-    R -->|Error| T[Log error]
-    P -->|All done| U{{Slack: script_logs<br/>recap par owner}}
+    R -->|Success| S[Log to langgraph_send_log<br/>status=success]
+    R -->|Error| T[Log to langgraph_send_log<br/>status=error]
+    S & T --> U{{Slack: script_logs<br/>recap par owner}}
     P -->|Errors| V{{sendErrorToScriptLogs}}
 ```
 
@@ -744,6 +744,21 @@ flowchart TD
 - Contact activities synced via Airbyte, read-only
 - Fields: `CONTACT_HUBSPOT_ID`, `CONTACT_FULL_NAME`, `CONTACT` (JSON), `DEALS` (JSON), `OWNER_INTENT_HUBSPOT` (JSON), `OWNER_CONTACT_INTENT_HUBSPOT` (JSON), `SENDER` (JSON), `ACTIVITY_ID`, `ACTIVITY_TYPE`, `ACTIVITY_RECORDED_ON`, `ACTIVITY_DIRECTION`, `ACTIVITY_METADATA` (JSON), `IS_CONTACT_IA_AGENT_ACTIVATED`, `IS_CANCEL_AGENT_IA_ACTIVATED`, `_airbyte_generation_id`
 - Used by `send-contacts-to-langgraph`
+
+### `langgraph_send_log`
+- **Supabase project**: `rcpcdpxqjxeikbssprdz` (ai_ae_sdr_agent)
+- Audit log for every contact sent to LangGraph (from `send-contacts-to-langgraph`)
+- PK: `id` (bigserial)
+- `sent_at`: timestamptz, `run_id`: batch correlation ID
+- `contact_hubspot_id`, `contact_full_name`, `contact_email`, `contact_phone`, `contact_linkedin_url`, `contact_company`: denormalized contact fields for quick inspection
+- `owner_hubspot_id`, `owner_name`: contact owner
+- `tier`: 1 (active deal) or 2 (no active deal)
+- `total_activities`: number of activities in payload
+- `langgraph_run_id`: LangGraph run ID (null on error)
+- `status`: `success` or `error`
+- `error_message`: error details (null on success)
+- `payload`: jsonb, full JSON sent to LangGraph
+- Indexed on `(sent_at, contact_hubspot_id)`
 
 ### `tchat_conversations`
 - **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync) — via `TCHAT_SUPPORT_SYNC_SUPABASE_URL`/`TCHAT_SUPPORT_SYNC_SUPABASE_SERVICE_KEY`
