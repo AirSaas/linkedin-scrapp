@@ -2,9 +2,22 @@ import { logger } from "@trigger.dev/sdk/v3";
 
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 5000;
+const AUTH_RETRY_DELAY_MS = 5 * 60 * 1000; // 5 min — laisser Unipile refresh la session LinkedIn
 
 async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildFetchOptions(method: string, body?: unknown): RequestInit {
+  return {
+    method,
+    headers: {
+      "X-API-KEY": process.env.UNIPILE_API_KEY!,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  };
 }
 
 async function request(
@@ -21,20 +34,29 @@ async function request(
       await sleep(RETRY_DELAY_MS);
     }
 
-    const res = await fetch(url, {
-      method,
-      headers: {
-        "X-API-KEY": process.env.UNIPILE_API_KEY!,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    const res = await fetch(url, buildFetchOptions(method, body));
 
     if (res.status === 429) {
       logger.warn(`Rate limit 429 on ${method} ${path}`);
       lastError = new Error(`429 Rate Limit on ${method} ${path}`);
       continue;
+    }
+
+    // 401: un seul retry après 5 min (session LinkedIn peut se renouveler côté Unipile)
+    if (res.status === 401 && attempt === 0) {
+      logger.warn(`Auth expired 401 on ${method} ${path} — retrying in 5 min`);
+      await sleep(AUTH_RETRY_DELAY_MS);
+
+      const retry = await fetch(url, buildFetchOptions(method, body));
+      if (retry.ok) {
+        logger.info(`Auth retry succeeded for ${method} ${path}`);
+        return retry.json();
+      }
+
+      const text = await retry.text();
+      throw new Error(
+        `Unipile ${method} ${path} failed after auth retry: ${retry.status} — ${text}`
+      );
     }
 
     if (!res.ok) {
