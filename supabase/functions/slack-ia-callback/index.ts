@@ -33,12 +33,24 @@ function verifySlackSignature(
     createHmac("sha256", signingSecret).update(sigBasestring).digest("hex");
 
   try {
-    return timingSafeEqual(
-      Buffer.from(mySignature, "utf8"),
-      Buffer.from(signature, "utf8")
-    );
-  } catch {
-    console.error("[signature] timingSafeEqual failed");
+    const a = new TextEncoder().encode(mySignature);
+    const b = new TextEncoder().encode(signature);
+    if (a.byteLength !== b.byteLength) {
+      console.warn("[signature] Length mismatch", {
+        expected: mySignature.length,
+        received: signature.length,
+        expectedSig: mySignature,
+        receivedSig: signature,
+      });
+      return false;
+    }
+    return timingSafeEqual(a, b);
+  } catch (err) {
+    console.error("[signature] timingSafeEqual failed", {
+      error: err instanceof Error ? err.message : String(err),
+      expectedLen: mySignature.length,
+      receivedLen: signature.length,
+    });
     return false;
   }
 }
@@ -208,9 +220,17 @@ Deno.serve(async (req) => {
   const signature = req.headers.get("X-Slack-Signature") ?? "";
 
   if (!verifySlackSignature(rawBody, timestamp, signature, signingSecret)) {
-    console.warn("[auth] Invalid signature rejected");
+    console.warn("[auth] Signature verification failed", {
+      hasSigningSecret: !!signingSecret,
+      signingSecretLength: signingSecret.length,
+      timestampAge: Math.floor(Date.now() / 1000) - parseInt(timestamp, 10),
+      signaturePrefix: signature?.substring(0, 10),
+      hasTimestamp: !!timestamp,
+    });
     return new Response("Invalid signature", { status: 401 });
   }
+
+  console.log("[auth] Signature verified OK");
 
   // Parse Slack interactive payload (URL-encoded with a "payload" field)
   const params = new URLSearchParams(rawBody);
