@@ -26,8 +26,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/get-team-connections.ts` — fetches 1st-degree LinkedIn connections for all team members
 - `trigger/lgm-process-intent-events.ts` — processes J-1 intent events + concurrent contacts → routes to LGM or HubSpot, sends grouped Slack recap. Also exports `lgm-process-intent-events-10-days` backfill task (same logic, 10-day lookback). Logs every routing decision to `lgm_send_log` for audit.
 - `trigger/audit-lgm-sends.ts` — weekly audit: queries `lgm_send_log` (7 days), compares with LGM audience sizes via API, posts report to `script_logs` Slack
-- `trigger/sync-workspace-activities.ts` — cron 5h: syncs HubSpot activities (notes, emails, calls, meetings, tasks) to custom Workspace objects (`2-44514393`) via batch association API. Migrated from Google Apps Script with ~30x fewer API calls
-- `trigger/sync-workspace-comms.ts` — cron 5h: syncs HubSpot communications (LinkedIn/SMS/WhatsApp, `0-18`) to Workspace objects. Same pattern as sync-workspace-activities
+- `trigger/sync-workspace-activities.ts` — cron 5h: syncs HubSpot activities (notes, emails, calls, meetings, tasks) AND communications (`0-18`) to custom Workspace objects (`2-44514393`) via batch association API. Migrated from Google Apps Script with ~30x fewer API calls
 - `trigger/workspace-cleanup-backfill.ts` — manual tasks: cleanup (delete all workspace associations), backfill (recreate from contacts), and combo. Payload: `{ workspaceIds: string[] }`
 - `trigger/lib/hubspot-workspace.ts` — shared helpers for workspace sync: batch association read/create/delete, contact email filtering, activity search
 - `trigger/hubspot-cleanup-email-associations.ts` — removes parasitic email-contact associations in HubSpot (emails with >3 contacts where contact not in from/to/cc/bcc)
@@ -82,7 +81,7 @@ flowchart LR
 
     UN --> GPV[get-profil-views] & GSC[get-strategic-connections] & GSP[get-strategic-people] & GTC[get-team-connections] & ILM[import-linkedin-messages]
     SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph]
-    HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM & SWA[sync-workspace-activities] & SWC[sync-workspace-comms]
+    HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM & SWA[sync-workspace-activities]
     MJ --> SMC[sync-modjo-calls]
     CR --> BCS[batch-crisp-to-supabase] & DBCS[daily-batch-crisp TMP] & SCS[sync-crisp-to-supabase]
     SB --> WUR[weekly-unanswered-recap]
@@ -97,7 +96,6 @@ flowchart LR
     ALS --> SL
     HCE --> HS_O & SL
     SWA --> HS_O & SL
-    SWC --> HS_O & SL
     ILM --> SB_O & HS_O & ZP & SL
     WMR --> SL
     DCA --> ZP
@@ -261,7 +259,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([Cron 5h]) --> B[Phase 1: Search activités<br/>notes, emails, calls, meetings, tasks<br/>hs_lastmodifieddate >= now-5h]
+    A([Cron 5h]) --> B[Phase 1: Search activités<br/>notes, emails, calls, meetings, tasks, communications<br/>hs_lastmodifieddate >= now-5h]
     B --> C[Phase 2: Batch activity→contact<br/>POST /v4/associations batch/read<br/>100 activités/requête]
     C --> D[Phase 3: Batch fetch emails<br/>POST /v3/contacts/batch/read<br/>filtrer domaines internes]
     D --> E[Phase 4: Batch contact→workspace<br/>POST /v4/associations/0-1/2-44514393/batch/read]
@@ -270,10 +268,6 @@ flowchart TD
     G --> H{{Slack: SLACK_WEBHOOK_SYNC_WORKSPACE}}
     G --> I{{Slack: script_logs si erreurs}}
 ```
-
-### `sync-workspace-comms` (cron 5h)
-
-Même structure que `sync-workspace-activities` mais pour le type `communications` (0-18) uniquement.
 
 ### `hubspot-cleanup-email-associations` (daily)
 

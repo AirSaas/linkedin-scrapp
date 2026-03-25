@@ -1,6 +1,7 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import {
   ACTIVITY_TYPES,
+  COMMUNICATION_TYPE_ID,
   type ActivityRecord,
   type AssociationPair,
   batchCheckExistingAssociations,
@@ -36,13 +37,18 @@ export const syncWorkspaceActivities = schedules.task({
     const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
     const errors: TaskError[] = [];
 
-    // ====== PHASE 1: Search activities (5 types) ======
+    // ====== PHASE 1: Search activities (5 types + communications) ======
     logger.info("Phase 1: Collecting recent activities...");
 
     const allActivities: ActivityRecord[] = [];
     const allActivityIdsByType = new Map<string, string[]>();
 
-    for (const [slug, typeId] of Object.entries(ACTIVITY_TYPES)) {
+    const ALL_OBJECT_TYPES: Record<string, string> = {
+      ...ACTIVITY_TYPES,
+      communications: COMMUNICATION_TYPE_ID,
+    };
+
+    for (const [slug, typeId] of Object.entries(ALL_OBJECT_TYPES)) {
       try {
         const ids = await searchActivitiesSince(slug, sinceMs);
         logger.info(`  ${slug}: ${ids.length} activities found`);
