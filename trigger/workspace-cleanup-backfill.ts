@@ -103,7 +103,7 @@ export const workspaceCleanup = task({
 
 export const workspaceBackfill = task({
   id: "workspace-backfill",
-  maxDuration: 900,
+  maxDuration: 3600, // 1h for large backfills
   run: async (payload: { workspaceIds: string[] }) => {
     const { workspaceIds } = payload;
     logger.info(`=== START workspace-backfill === ${workspaceIds.length} workspaces`);
