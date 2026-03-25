@@ -26,6 +26,10 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/get-team-connections.ts` — fetches 1st-degree LinkedIn connections for all team members
 - `trigger/lgm-process-intent-events.ts` — processes J-1 intent events + concurrent contacts → routes to LGM or HubSpot, sends grouped Slack recap. Also exports `lgm-process-intent-events-10-days` backfill task (same logic, 10-day lookback). Logs every routing decision to `lgm_send_log` for audit.
 - `trigger/audit-lgm-sends.ts` — weekly audit: queries `lgm_send_log` (7 days), compares with LGM audience sizes via API, posts report to `script_logs` Slack
+- `trigger/sync-workspace-activities.ts` — cron 5h: syncs HubSpot activities (notes, emails, calls, meetings, tasks) to custom Workspace objects (`2-44514393`) via batch association API. Migrated from Google Apps Script with ~30x fewer API calls
+- `trigger/sync-workspace-comms.ts` — cron 5h: syncs HubSpot communications (LinkedIn/SMS/WhatsApp, `0-18`) to Workspace objects. Same pattern as sync-workspace-activities
+- `trigger/workspace-cleanup-backfill.ts` — manual tasks: cleanup (delete all workspace associations), backfill (recreate from contacts), and combo. Payload: `{ workspaceIds: string[] }`
+- `trigger/lib/hubspot-workspace.ts` — shared helpers for workspace sync: batch association read/create/delete, contact email filtering, activity search
 - `trigger/hubspot-cleanup-email-associations.ts` — removes parasitic email-contact associations in HubSpot (emails with >3 contacts where contact not in from/to/cc/bcc)
 - `trigger/import-linkedin-messages.ts` — imports LinkedIn messages from last 24h via Unipile → Supabase, sends 1:1 messages to HubSpot (communication) + Zapier webhook
 - `trigger/weekly-meetings-recap.ts` — weekly Monday recap of HubSpot meetings in SQL pipeline, enriched with AI (Anthropic Sonnet) and sent to Slack
@@ -34,6 +38,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/data-freshness-check.ts` — daily monitoring of Supabase table freshness (PRC_INTENT_EVENTS, scrapped_visit, scrapped_reaction, messages, threads), uses Claude Sonnet for anomaly detection, alerts on script_logs
 - `trigger/sync-modjo-calls.ts` — syncs Modjo calls (transcripts, participants, HubSpot IDs, AI summaries) to Supabase `modjo_calls` table via Modjo API, hourly cron
 - `trigger/send-contacts-to-langgraph.ts` — daily cron: fetches PRC_CONTACT_ACTIVITIES (ai_ae_sdr_agent Supabase `rcpcdpxqjxeikbssprdz`), skips contacts with final_decision < 3 days, prioritizes active pipeline SQL deals (Tier 1) then FIFO by oldest decision, caps at 15 contacts/owner/run, sends to LangGraph async /runs endpoint
+- `trigger/send-single-contact-to-langgraph.ts` — manual task: sends a single contact to LangGraph (by HubSpotID or random pick), bypasses cooldown, reuses batch functions from `send-contacts-to-langgraph.ts`
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
 - `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
@@ -77,7 +82,7 @@ flowchart LR
 
     UN --> GPV[get-profil-views] & GSC[get-strategic-connections] & GSP[get-strategic-people] & GTC[get-team-connections] & ILM[import-linkedin-messages]
     SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph]
-    HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM
+    HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM & SWA[sync-workspace-activities] & SWC[sync-workspace-comms]
     MJ --> SMC[sync-modjo-calls]
     CR --> BCS[batch-crisp-to-supabase] & DBCS[daily-batch-crisp TMP] & SCS[sync-crisp-to-supabase]
     SB --> WUR[weekly-unanswered-recap]
@@ -91,6 +96,8 @@ flowchart LR
     SB --> ALS[audit-lgm-sends]
     ALS --> SL
     HCE --> HS_O & SL
+    SWA --> HS_O & SL
+    SWC --> HS_O & SL
     ILM --> SB_O & HS_O & ZP & SL
     WMR --> SL
     DCA --> ZP
@@ -249,6 +256,24 @@ flowchart TD
     F --> G[Construire rapport comparatif<br/>audiences + HubSpot + skipped]
     G --> H{{Slack: script_logs}}
 ```
+
+### `sync-workspace-activities` (cron 5h)
+
+```mermaid
+flowchart TD
+    A([Cron 5h]) --> B[Phase 1: Search activités<br/>notes, emails, calls, meetings, tasks<br/>hs_lastmodifieddate >= now-5h]
+    B --> C[Phase 2: Batch activity→contact<br/>POST /v4/associations batch/read<br/>100 activités/requête]
+    C --> D[Phase 3: Batch fetch emails<br/>POST /v3/contacts/batch/read<br/>filtrer domaines internes]
+    D --> E[Phase 4: Batch contact→workspace<br/>POST /v4/associations/0-1/2-44514393/batch/read]
+    E --> F[Phase 5: Grouper par<br/>typeId + workspaceId]
+    F --> G[Phase 6: Batch check existing<br/>+ batch create missing]
+    G --> H{{Slack: SLACK_WEBHOOK_SYNC_WORKSPACE}}
+    G --> I{{Slack: script_logs si erreurs}}
+```
+
+### `sync-workspace-comms` (cron 5h)
+
+Même structure que `sync-workspace-activities` mais pour le type `communications` (0-18) uniquement.
 
 ### `hubspot-cleanup-email-associations` (daily)
 
