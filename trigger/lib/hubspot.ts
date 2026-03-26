@@ -8,7 +8,8 @@ const BETWEEN_HUBSPOT_CALLS = 150;
 export async function callHubSpot(
   url: string,
   method: string,
-  payload?: unknown
+  payload?: unknown,
+  retries = 2
 ): Promise<Record<string, unknown>> {
   const token = process.env.HUBSPOT_ACCESS_TOKEN ?? "";
 
@@ -24,21 +25,38 @@ export async function callHubSpot(
     options.body = JSON.stringify(payload);
   }
 
-  const res = await fetch(url, options);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) {
+      const backoff = attempt === 1 ? 2000 : 5000;
+      logger.warn(`HubSpot retry ${attempt}/${retries}, waiting ${backoff}ms`);
+      await sleep(backoff);
+    }
 
-  if (res.status === 429) {
-    logger.warn("HubSpot rate limit 429, pausing 10s...");
-    await sleep(HUBSPOT_429_PAUSE);
-    return callHubSpot(url, method, payload);
-  }
+    const res = await fetch(url, options);
 
-  if (!res.ok) {
+    if (res.status === 429) {
+      logger.warn("HubSpot rate limit 429, pausing 10s...");
+      await sleep(HUBSPOT_429_PAUSE);
+      continue;
+    }
+
+    // Retry on transient 5xx (502, 503, 504...)
+    if (res.status >= 500 && attempt < retries) {
+      const text = await res.text();
+      logger.warn(`HubSpot ${res.status}, retrying: ${text.substring(0, 200)}`);
+      continue;
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`HTTP ${res.status}: ${text.substring(0, 300)}`);
+    }
+
     const text = await res.text();
-    throw new Error(`HTTP ${res.status}: ${text.substring(0, 300)}`);
+    return text.length > 0 ? JSON.parse(text) : {};
   }
 
-  const text = await res.text();
-  return text.length > 0 ? JSON.parse(text) : {};
+  throw new Error(`HubSpot call failed after ${retries} retries`);
 }
 
 export async function findHubSpotContact(

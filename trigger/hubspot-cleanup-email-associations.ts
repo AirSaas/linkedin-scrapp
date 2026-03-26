@@ -1,5 +1,6 @@
 import { logger, schedules } from "@trigger.dev/sdk/v3";
 import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
+import { callHubSpot } from "./lib/hubspot.js";
 
 // ============================================
 // CONFIGURATION
@@ -12,10 +13,7 @@ const MIN_CONTACTS_THRESHOLD = 3;
 // Internal domains — never dissociate these
 const INTERNAL_DOMAINS = ["airsaas.io"];
 
-const RATE_LIMIT = {
-  PAUSE_BETWEEN_API_CALLS: 150,
-  PAUSE_RATE_LIMIT_429: 10000,
-};
+const PAUSE_BETWEEN_API_CALLS = 150;
 
 // ============================================
 // TYPES
@@ -120,7 +118,7 @@ export const hubspotCleanupEmailAssociationsTask = schedules.task({
 
           try {
             await removeAssociation(emailId, contact.id);
-            await sleep(RATE_LIMIT.PAUSE_BETWEEN_API_CALLS);
+            await sleep(PAUSE_BETWEEN_API_CALLS);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error(
@@ -175,41 +173,6 @@ export const hubspotCleanupEmailAssociationsTask = schedules.task({
 // ============================================
 // HUBSPOT API HELPERS
 // ============================================
-async function callHubSpot(
-  url: string,
-  method: string,
-  payload?: unknown
-): Promise<Record<string, unknown>> {
-  const token = process.env.HUBSPOT_ACCESS_TOKEN ?? "";
-
-  const options: RequestInit = {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-  };
-
-  if (payload && ["POST", "PUT", "PATCH"].includes(method)) {
-    options.body = JSON.stringify(payload);
-  }
-
-  const res = await fetch(url, options);
-
-  if (res.status === 429) {
-    logger.warn("Rate limit 429, pausing 10s...");
-    await sleep(RATE_LIMIT.PAUSE_RATE_LIMIT_429);
-    return callHubSpot(url, method, payload);
-  }
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HTTP ${res.status}: ${text.substring(0, 300)}`);
-  }
-
-  const text = await res.text();
-  return text.length > 0 ? JSON.parse(text) : {};
-}
 
 async function getRecentEmails(sinceDate: Date): Promise<HubSpotEmail[]> {
   const allEmails: HubSpotEmail[] = [];
