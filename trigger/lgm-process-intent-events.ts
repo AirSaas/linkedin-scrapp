@@ -617,11 +617,11 @@ function logRoutingDecision(entry: LogEntry): void {
 // ============================================
 // HUBSPOT HELPERS
 // ============================================
-async function getHubspotContactCancelStatus(
+async function getHubspotContactIaStatus(
   contactHubspotId: string
-): Promise<{ success: boolean; cancelValue: string | null }> {
+): Promise<{ success: boolean; cancelValue: string | null; activatedValue: string | null }> {
   const token = process.env.HUBSPOT_ACCESS_TOKEN ?? "";
-  const url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactHubspotId}?properties=cancel_agent_ia_activated`;
+  const url = `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/${contactHubspotId}?properties=cancel_agent_ia_activated,agent_ia_activated`;
 
   try {
     const res = await fetch(url, {
@@ -634,23 +634,25 @@ async function getHubspotContactCancelStatus(
 
     if (res.ok) {
       const data = (await res.json()) as {
-        properties?: { cancel_agent_ia_activated?: string };
+        properties?: { cancel_agent_ia_activated?: string; agent_ia_activated?: string };
       };
       const cancelValue =
         data.properties?.cancel_agent_ia_activated ?? null;
+      const activatedValue =
+        data.properties?.agent_ia_activated ?? null;
       logger.info(
-        `HubSpot GET OK - Contact: ${contactHubspotId}, cancel: ${cancelValue || "(empty)"}`
+        `HubSpot GET OK - Contact: ${contactHubspotId}, cancel: ${cancelValue || "(empty)"}, activated: ${activatedValue || "(empty)"}`
       );
-      return { success: true, cancelValue };
+      return { success: true, cancelValue, activatedValue };
     } else {
       const text = await res.text();
       logger.error(`HubSpot GET error ${res.status}: ${text}`);
-      return { success: false, cancelValue: null };
+      return { success: false, cancelValue: null, activatedValue: null };
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error(`HubSpot GET exception: ${msg}`);
-    return { success: false, cancelValue: null };
+    return { success: false, cancelValue: null, activatedValue: null };
   }
 }
 
@@ -1200,14 +1202,31 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
               assignedOwnerContacts.add(contactHubspotId);
             }
 
-            // Step 2: Check cancel before queuing notification (only on first occurrence)
+            // Step 2: Check cancel + already activated before queuing notification (only on first occurrence)
             if (!pendingSlackNotifs.has(contactHubspotId)) {
-              const cancelResult = await getHubspotContactCancelStatus(contactHubspotId);
-              if (cancelResult.success && cancelResult.cancelValue !== null &&
-                  cancelResult.cancelValue !== "" && cancelResult.cancelValue !== undefined) {
+              const iaStatus = await getHubspotContactIaStatus(contactHubspotId);
+              if (!iaStatus.success) {
+                // HubSpot API error — do NOT queue notification (safe default: skip)
+                logger.error(`HubSpot GET failed for ${fullName} (${contactHubspotId}) — skipping notification`);
+                logRoutingDecision({
+                  ...logBase, destination: "SKIPPED", skip_reason: "hubspot_get_failed",
+                  hubspot_contact_id: contactHubspotId, hubspot_success: false,
+                });
+                hubspotFailed++;
+                shouldSendSlack = false;
+              } else if (iaStatus.cancelValue !== null &&
+                  iaStatus.cancelValue !== "" && iaStatus.cancelValue !== undefined) {
                 logger.info(`HubSpot skip notif - cancel_agent_ia non-empty for ${fullName} (owner assigned)`);
                 hubspotSuccess++;
                 shouldSendSlack = true;
+              } else if (iaStatus.activatedValue === "true") {
+                logger.info(`HubSpot skip notif - agent_ia already activated for ${fullName} (owner assigned)`);
+                logRoutingDecision({
+                  ...logBase, destination: "SKIPPED", skip_reason: "already_activated",
+                  hubspot_contact_id: contactHubspotId,
+                });
+                hubspotSkipped++;
+                shouldSendSlack = false;
               } else {
                 // Step 3: Queue Slack notification (will be sent after loop, merged by contact)
                 const slackChannelId = SLACK_IA_CHANNELS[normalizeOwner(intentOwner)];
@@ -1252,11 +1271,11 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
             shouldSendSlack = false;
           }
         } else if (businessOwner === intentOwner) {
-          // Cas 2: BUSINESS_OWNER = INTENT_OWNER → check cancel, then queue Slack notif for activation
-          // Only check cancel on first occurrence for this contact
+          // Cas 2: BUSINESS_OWNER = INTENT_OWNER → check cancel + already activated, then queue Slack notif
+          // Only check on first occurrence for this contact
           if (!pendingSlackNotifs.has(contactHubspotId)) {
             const getResult =
-              await getHubspotContactCancelStatus(contactHubspotId);
+              await getHubspotContactIaStatus(contactHubspotId);
 
             if (!getResult.success) {
               logRoutingDecision({
@@ -1275,6 +1294,16 @@ async function processIntentEvents(teamMembers: TeamMember[], lookbackDays = 1) 
               );
               logRoutingDecision({
                 ...logBase, destination: "SKIPPED", skip_reason: "cancel_agent_ia",
+                hubspot_contact_id: contactHubspotId,
+              });
+              hubspotSkipped++;
+              shouldSendSlack = false;
+            } else if (getResult.activatedValue === "true") {
+              logger.info(
+                `HubSpot skip - agent_ia already activated for ${fullName}`
+              );
+              logRoutingDecision({
+                ...logBase, destination: "SKIPPED", skip_reason: "already_activated",
                 hubspot_contact_id: contactHubspotId,
               });
               hubspotSkipped++;
@@ -1501,7 +1530,7 @@ async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays
       if (existingHubspotId) {
         // Contact exists → update
         const getResult =
-          await getHubspotContactCancelStatus(existingHubspotId);
+          await getHubspotContactIaStatus(existingHubspotId);
 
         if (!getResult.success) {
           logRoutingDecision({
@@ -1520,6 +1549,15 @@ async function processConcurrentContacts(teamMembers: TeamMember[], lookbackDays
           );
           logRoutingDecision({
             ...logBase, destination: "SKIPPED", skip_reason: "cancel_agent_ia",
+            hubspot_contact_id: existingHubspotId,
+          });
+          hubspotUpdateSkipped++;
+        } else if (getResult.activatedValue === "true") {
+          logger.info(
+            `HubSpot skip - agent_ia already activated for ${fullName}`
+          );
+          logRoutingDecision({
+            ...logBase, destination: "SKIPPED", skip_reason: "already_activated",
             hubspot_contact_id: existingHubspotId,
           });
           hubspotUpdateSkipped++;
