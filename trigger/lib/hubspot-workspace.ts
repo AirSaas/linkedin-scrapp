@@ -30,6 +30,10 @@ export const EXCLUDED_EMAIL_DOMAINS = [
   "@altioras.fr",
 ];
 
+export const EXCLUDED_CONTACT_EMAILS = [
+  "thibaut.gautier@tgcc.fr",
+];
+
 // ============================================
 // TYPES
 // ============================================
@@ -238,11 +242,16 @@ export function filterExternalContacts(
       continue;
     }
 
+    const emailLower = email.toLowerCase();
+
     const isInternal = EXCLUDED_EMAIL_DOMAINS.some((domain) =>
-      email.endsWith(domain.toLowerCase())
+      emailLower.endsWith(domain)
+    );
+    const isExcluded = EXCLUDED_CONTACT_EMAILS.some(
+      (e) => emailLower === e.toLowerCase()
     );
 
-    if (!isInternal) {
+    if (!isInternal && !isExcluded) {
       external.add(contactId);
     }
   }
