@@ -25,6 +25,7 @@ interface WhatsAppAccount {
   hubspot_id: string | null;
   firstname: string;
   lastname: string;
+  whatsapp_phone: string | null;
 }
 
 interface WhatsAppChat {
@@ -128,7 +129,7 @@ export const importWhatsappMessagesTask = schedules.task({
             if (!threadExists) {
               await getSupabase().from("scrapped_whatsapp_threads").insert({
                 id: chat.id,
-                phone_number: contact.public_identifier,
+                phone_number: contactPhoneE164 ?? contact.public_identifier,
                 contact_name: contact.name,
                 contact_phone_e164: contactPhoneE164,
                 last_activity_at: chat.timestamp,
@@ -142,6 +143,7 @@ export const importWhatsappMessagesTask = schedules.task({
               await getSupabase()
                 .from("scrapped_whatsapp_threads")
                 .update({
+                  phone_number: contactPhoneE164 ?? contact.public_identifier,
                   last_activity_at: chat.timestamp,
                   is_read: chat.unread_count === 0,
                   contact_name: contact.name,
@@ -163,9 +165,12 @@ export const importWhatsappMessagesTask = schedules.task({
                 // Determine sender info
                 const isSender = msg.is_sender === 1;
                 const senderName = isSender ? accountLabel : contact.name;
+                const ownerPhoneE164 = account.whatsapp_phone
+                  ? normalizePhoneToE164(account.whatsapp_phone)
+                  : null;
                 const senderPhone = isSender
-                  ? undefined
-                  : contact.public_identifier;
+                  ? ownerPhoneE164
+                  : contactPhoneE164;
 
                 const messageRecord = {
                   id: msg.id,
@@ -271,7 +276,7 @@ export const importWhatsappMessagesTask = schedules.task({
 async function getWhatsAppAccounts(): Promise<WhatsAppAccount[]> {
   const { data, error } = await getSupabase()
     .from("workspace_team")
-    .select("unipile_whatsapp_account_id, hubspot_id, firstname, lastname")
+    .select("unipile_whatsapp_account_id, hubspot_id, firstname, lastname, whatsapp_phone")
     .not("unipile_whatsapp_account_id", "is", null);
 
   if (error) throw new Error(`Failed to fetch WhatsApp accounts: ${error.message}`);
@@ -381,6 +386,14 @@ async function getAllMessages(chatId: string): Promise<WhatsAppMessage[]> {
 function extractPhoneFromIdentifier(identifier: string): string | null {
   const match = identifier.match(/^(\d+)@/);
   return match ? `+${match[1]}` : null;
+}
+
+/** Normalize local or international phone to E.164: "0644640391" → "+33644640391", "+44..." → "+44..." */
+function normalizePhoneToE164(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  if (phone.startsWith("+")) return `+${digits}`;
+  if (digits.startsWith("0")) return `+33${digits.slice(1)}`;
+  return `+${digits}`;
 }
 
 /** Normalize any phone string to just digits: "+33 6 51 81 04 25" → "33651810425" */
