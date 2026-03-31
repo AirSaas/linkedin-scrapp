@@ -31,6 +31,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/lib/hubspot-workspace.ts` — shared helpers for workspace sync: batch association read/create/delete, contact email filtering, activity search
 - `trigger/hubspot-cleanup-email-associations.ts` — removes parasitic email-contact associations in HubSpot (emails with >3 contacts where contact not in from/to/cc/bcc)
 - `trigger/import-linkedin-messages.ts` — imports LinkedIn messages from last 24h via Unipile → Supabase, sends 1:1 messages to HubSpot (communication) + Zapier webhook
+- `trigger/import-whatsapp-messages.ts` — imports WhatsApp messages from last 12h via Unipile → Supabase, matches contacts by phone (9 last digits) → HubSpot communication (WHATS_APP). Cron 4h, 1:1 chats only
 - `trigger/weekly-meetings-recap.ts` — weekly Monday recap of HubSpot meetings in SQL pipeline, enriched with AI (Anthropic Sonnet) and sent to Slack
 - `trigger/weekly-unanswered-recap.ts` — weekly Friday 8h30 recap of unanswered LinkedIn messages (all team) + Gmail emails (Bertran) with AI classification (Claude Sonnet) to filter spam/noise, posted to Slack via `webhook_unanswered_recap`
 - `trigger/deal-clean-alert.ts` — alerts on deals needing cleanup (date dépassée, sans date en RDV à planifier, sans montant après Demo) via Zapier webhook
@@ -79,7 +80,7 @@ flowchart LR
         LG(LangGraph API)
     end
 
-    UN --> GPV[get-profil-views] & GSC[get-strategic-connections] & GSP[get-strategic-people] & GTC[get-team-connections] & ILM[import-linkedin-messages]
+    UN --> GPV[get-profil-views] & GSC[get-strategic-connections] & GSP[get-strategic-people] & GTC[get-team-connections] & ILM[import-linkedin-messages] & IWM[import-whatsapp-messages]
     SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph]
     HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM & SWA[sync-workspace-activities]
     MJ --> SMC[sync-modjo-calls]
@@ -97,6 +98,7 @@ flowchart LR
     HCE --> HS_O & SL
     SWA --> HS_O & SL
     ILM --> SB_O & HS_O & ZP & SL
+    IWM --> SB_O & HS_O & SL
     WMR --> SL
     DCA --> ZP
     DFC --> SL
@@ -311,6 +313,33 @@ flowchart TD
     O -->|Yes| Q[POST HubSpot communication<br/>with contact + deal associations]
     Q --> R{{POST Zapier: webhook_linkedin_message}}
     C -->|Errors| S{{Slack: script_logs}}
+```
+
+### `import-whatsapp-messages` (cron 4h)
+
+```mermaid
+flowchart TD
+    A([Cron 4h]) --> B[Fetch workspace_team<br/>with unipile_whatsapp_account_id]
+    B --> C{For each<br/>WhatsApp account}
+    C --> D[Fetch Unipile chats<br/>since 12h ago — paginated]
+    D --> E{For each thread}
+    E --> F[Fetch attendees]
+    F --> G{1:1 chat?<br/>attendees = 1}
+    G -->|No| H[Skip group chat]
+    G -->|Yes| I[Extract phone E.164<br/>from attendee]
+    I --> J{Thread exists<br/>in DB?}
+    J -->|No| K[Insert to<br/>scrapped_whatsapp_threads]
+    J -->|Yes| L[Update last_activity_at]
+    K & L --> M[Fetch messages — paginated]
+    M --> N{For each message}
+    N --> O{Message exists<br/>in DB?}
+    O -->|Yes| P[Skip]
+    O -->|No| Q[Insert to<br/>scrapped_whatsapp_messages]
+    Q --> R[findHubSpotContactByPhone<br/>9 last digits matching]
+    R -->|Not found| S[hubspot_communication_id = null]
+    R -->|Found| T[POST HubSpot communication<br/>WHATS_APP + contact + deals]
+    T --> U[Update hubspot_communication_id]
+    C -->|Errors| V{{Slack: script_logs}}
 ```
 
 ### `weekly-meetings-recap` (weekly Monday)
@@ -736,6 +765,30 @@ flowchart TD
 - `sender_data`: JSON in Ghost Genius format (`{id, type, full_name, url, profile_picture}`)
 - `hubspot_communication_id`: HubSpot communication ID (set after HubSpot sync for 1:1 threads)
 - `participant_owner_id`, `participants_numbers`, `main_participant_id`: denormalized from thread
+
+### `scrapped_whatsapp_threads`
+- WhatsApp messaging threads (from `import-whatsapp-messages`)
+- PK: `id` (Unipile chat ID)
+- `phone_number`: raw WhatsApp ID (e.g. `33651810425@s.whatsapp.net`)
+- `contact_name`: attendee display name
+- `contact_phone_e164`: normalized phone (e.g. `+33651810425`)
+- `last_activity_at`: ISO timestamp, `is_read`: boolean
+- `participant_owner_id`: team member's `unipile_whatsapp_account_id`
+- `participants_numbers`: always 2 for 1:1 chats
+
+### `scrapped_whatsapp_messages`
+- WhatsApp messages (from `import-whatsapp-messages`)
+- PK: `id` (Unipile message ID)
+- `thread_id`: references `scrapped_whatsapp_threads.id`
+- `provider_id`: WhatsApp native message ID
+- `message_date`: ISO timestamp, `is_read`: boolean, `text`: message content
+- `is_sender`: boolean (true if sent by team member)
+- `sender_id`: sender's WhatsApp @lid ID
+- `sender_name`, `sender_phone`: sender info
+- `participant_owner_id`: team member's `unipile_whatsapp_account_id`
+- `contact_phone_e164`: other participant's phone in E.164 format
+- `attachments`: jsonb array, `original`: full Unipile message payload
+- `hubspot_communication_id`: HubSpot communication ID (set after phone match, null if no match)
 
 ### `modjo_calls`
 - Modjo calls synced hourly (from `sync-modjo-calls`)
