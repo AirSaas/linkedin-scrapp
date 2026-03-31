@@ -7,7 +7,7 @@ import { callHubSpot } from "./lib/hubspot.js";
 // ============================================
 // CONFIGURATION
 // ============================================
-const LOOKBACK_HOURS = 48; // TODO: revert to 12 after test
+const LOOKBACK_HOURS = 12;
 const HUBSPOT_API_BASE = "https://api.hubapi.com";
 const BETWEEN_HUBSPOT_CALLS = 150;
 
