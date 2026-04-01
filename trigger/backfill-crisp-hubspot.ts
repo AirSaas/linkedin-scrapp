@@ -3,6 +3,7 @@ import { getSupabase } from "./lib/supabase.js";
 import {
   findHubSpotContactByEmail,
   sendCrispMessageToHubSpot,
+  callHubSpot,
 } from "./lib/hubspot.js";
 import { updateCrispMessageHubSpotId } from "./lib/crisp-supabase.js";
 import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
@@ -13,11 +14,14 @@ import { createClient } from "@supabase/supabase-js";
 // ============================================
 // Sends Crisp text messages missing hubspot_communication_id to HubSpot.
 // Processes BATCH_SIZE messages per run, then self-triggers if more remain.
+// Messages with no HubSpot contact match are marked SKIPPED_NO_CONTACT
+// to avoid re-processing.
 // Trigger manually from dashboard — no cron.
 // ============================================
 
 const BATCH_SIZE = 200;
 const BETWEEN_MESSAGES = 200;
+const SKIPPED_NO_CONTACT = "SKIPPED_NO_CONTACT";
 
 function getCrispSupabase() {
   return createClient(
@@ -29,9 +33,10 @@ function getCrispSupabase() {
 export const backfillCrispHubspotTask = task({
   id: "backfill-crisp-hubspot",
   maxDuration: 1800,
-  run: async (payload?: { dryRun?: boolean }) => {
+  run: async (payload?: { dryRun?: boolean; patchBody?: boolean }) => {
     const dryRun = payload?.dryRun ?? false;
-    logger.info(`=== START backfill-crisp-hubspot ${dryRun ? "(DRY RUN)" : ""} ===`);
+    const patchBody = payload?.patchBody ?? false;
+    logger.info(`=== START backfill-crisp-hubspot ${dryRun ? "(DRY RUN)" : ""} ${patchBody ? "(PATCH BODY)" : ""} ===`);
 
     // 1. Build operator mapping: crisp_operator_id → hubspot_id
     const operatorMap = new Map<string, string>();
@@ -50,8 +55,14 @@ export const backfillCrispHubspotTask = task({
       logger.warn(`Failed to load operator mapping: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    // 2. Fetch batch of pending text messages with conversation email
     const sb = getCrispSupabase();
+
+    // PATCH MODE: update existing communications body to add [tchat_support] prefix
+    if (patchBody) {
+      return await patchExistingBodies(sb);
+    }
+
+    // 2. Fetch batch of pending text messages with conversation email
     const { data: messages, error: fetchError } = await sb
       .from("tchat_messages")
       .select(`
@@ -90,6 +101,7 @@ export const backfillCrispHubspotTask = task({
       const email = (msg as any).tchat_conversations?.contact_email as string | null;
       if (!email) {
         totalSkipped++;
+        await markSkipped(sb, msg.fingerprint);
         continue;
       }
 
@@ -105,6 +117,7 @@ export const backfillCrispHubspotTask = task({
 
         if (!contactId) {
           totalSkipped++;
+          await markSkipped(sb, msg.fingerprint);
           continue;
         }
 
@@ -132,6 +145,7 @@ export const backfillCrispHubspotTask = task({
           totalSent++;
         } else {
           totalSkipped++;
+          await markSkipped(sb, msg.fingerprint);
         }
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
@@ -146,8 +160,7 @@ export const backfillCrispHubspotTask = task({
       await sleep(BETWEEN_MESSAGES);
     }
 
-    const noProgress = totalSent === 0;
-    const isLastBatch = messages.length < BATCH_SIZE || noProgress;
+    const isLastBatch = messages.length < BATCH_SIZE;
 
     const summary = {
       success: true,
@@ -170,12 +183,10 @@ export const backfillCrispHubspotTask = task({
       }]);
     }
 
-    // Self-trigger next batch if more messages remain AND we made progress
-    if (!dryRun && messages.length >= BATCH_SIZE && !noProgress) {
+    // Self-trigger next batch if more messages remain
+    if (!dryRun && messages.length >= BATCH_SIZE) {
       logger.info("More messages remain — triggering next batch...");
       await backfillCrispHubspotTask.trigger({});
-    } else if (noProgress) {
-      logger.info("No messages were sent this batch — stopping to avoid infinite loop.");
     } else {
       logger.info("Backfill complete — no more messages to process.");
     }
@@ -183,3 +194,92 @@ export const backfillCrispHubspotTask = task({
     return summary;
   },
 });
+
+async function markSkipped(
+  sb: any,
+  fingerprint: string
+): Promise<void> {
+  const { error } = await sb
+    .from("tchat_messages")
+    .update({ hubspot_communication_id: SKIPPED_NO_CONTACT })
+    .eq("fingerprint", fingerprint);
+  if (error) {
+    logger.error(`Failed to mark ${fingerprint} as skipped: ${error.message}`);
+  }
+}
+
+/**
+ * Patch existing HubSpot communications to add [tchat_support] prefix.
+ * Finds messages with a real hubspot_communication_id (not SKIPPED) whose
+ * body doesn't have the prefix yet, and PATCHes them in HubSpot.
+ */
+async function patchExistingBodies(
+  sb: any
+): Promise<Record<string, unknown>> {
+  const { data: messages, error } = await sb
+    .from("tchat_messages")
+    .select(`
+      fingerprint,
+      content,
+      direction,
+      hubspot_communication_id,
+      tchat_conversations!inner(contact_email)
+    `)
+    .not("hubspot_communication_id", "is", null)
+    .neq("hubspot_communication_id", SKIPPED_NO_CONTACT)
+    .order("crisp_timestamp", { ascending: true })
+    .limit(BATCH_SIZE);
+
+  if (error) throw new Error(`Failed to fetch messages: ${error.message}`);
+  if (!messages || messages.length === 0) {
+    logger.info("No messages to patch — done!");
+    return { success: true, patched: 0, done: true };
+  }
+
+  let patched = 0;
+  let skipped = 0;
+  const errors: TaskError[] = [];
+
+  for (const msg of messages) {
+    const hsCommId = msg.hubspot_communication_id as string;
+    const directionLabel = msg.direction === "INBOUND" ? "Inbound" : "Outbound";
+    const newBody = `[tchat_support] ${directionLabel}: ${msg.content}`;
+
+    try {
+      await callHubSpot(
+        `https://api.hubapi.com/crm/v3/objects/communications/${hsCommId}`,
+        "PATCH",
+        { properties: { hs_communication_body: newBody } }
+      );
+      patched++;
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      // 404 = comm was deleted, skip
+      if (m.includes("404")) {
+        skipped++;
+      } else {
+        errors.push({ type: "Patch Body", code: "exception", message: `${hsCommId}: ${m}` });
+      }
+    }
+
+    await sleep(150);
+  }
+
+  const done = messages.length < BATCH_SIZE;
+  const summary = { success: true, patched, skipped, errors: errors.length, done };
+  logger.info("=== PATCH SUMMARY ===", summary);
+
+  if (!done) {
+    logger.info("More messages to patch — triggering next batch...");
+    await backfillCrispHubspotTask.trigger({ patchBody: true });
+  } else {
+    await sendErrorToScriptLogs("Patch Crisp → HubSpot body", [{
+      label: "Communications",
+      inserted: patched,
+      skipped,
+      errors,
+    }]);
+  }
+
+  return summary;
+}
