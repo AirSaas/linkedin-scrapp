@@ -41,7 +41,8 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/send-single-contact-to-langgraph.ts` — manual task: sends a single contact to LangGraph (by HubSpotID or random pick), bypasses cooldown, reuses batch functions from `send-contacts-to-langgraph.ts`
 - `trigger/batch-crisp-to-supabase.ts` — manual batch import of Crisp conversations/messages to Supabase (tchat-support-sync project)
 - `trigger/daily-batch-crisp-to-supabase.ts` — automated daily batch import (cron hourly, 25h min gap, cursor in `tchat_batch_cursor_tmp`). Temporary task — remove once historical import is complete.
-- `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project)
+- `trigger/sync-crisp-to-supabase.ts` — incremental cron sync of Crisp conversations/messages to Supabase (tchat-support-sync project). Also syncs new text messages to HubSpot as LIVE_CHAT communications (contact + workspace associations). Matches contacts by email, resolves HubSpot owner via `workspace_team.crisp_operator_id`
+- `trigger/backfill-crisp-hubspot.ts` — manual self-chaining task: backfills existing Crisp text messages to HubSpot LIVE_CHAT communications. Supports `{ dryRun: true }` payload
 - `trigger/import-circle-posts.ts` — weekly sync of Circle posts + comments from `ca-vient-de-sortir` space → Supabase `circle_posts` (tchat-support-sync project), incremental via `circle_sync_cursor`
 - `trigger/generate-faq-document.ts` — manual task: reads `tchat_faq_extractions` (score >= 3), consolidates themes + deduplicates via Claude Opus in batches, generates structured Markdown FAQ document, saves to `tchat_faq_documents`
 - `trigger/audit-circle-documentation.ts` — manual task: cross-references FAQ extractions with Circle articles, produces audit report with article rewrites (image-preserving), new article drafts, and orphan detection. Resume support via `tchat_doc_audit_items`. Saves to `tchat_faq_documents` with type `doc_audit`
@@ -489,18 +490,42 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([Cron via dashboard]) --> B[Read cursor from tchat_sync_cursor]
-    B --> C{Paginate conversations<br/>max 5 pages}
+    A([Cron horaire]) --> B[Read cursor from tchat_sync_cursor]
+    B --> B2[Load operator mapping<br/>workspace_team.crisp_operator_id]
+    B2 --> C{Paginate conversations<br/>max 10 pages}
     C --> D{For each conversation<br/>updated_at > cursor}
     D -->|Older than cursor| E[Stop pagination]
     D -->|Recent| F[Fetch metas + messages<br/>2 req Crisp]
     F --> G{For each message}
     G --> H{Exists by fingerprint?}
     H -->|Yes| I[Skip]
-    H -->|No| J[Insert message]
-    J --> K[Update conversation counters]
-    C -->|All done| L[Update cursor]
-    L --> M{{Slack: script_logs if errors}}
+    H -->|No| J[Insert message to Supabase]
+    J --> K{type = text<br/>AND contact_email?}
+    K -->|No| L[Skip HubSpot]
+    K -->|Yes| M[findHubSpotContactByEmail]
+    M -->|Not found| N[Count noMatch]
+    M -->|Found| O[POST HubSpot communication<br/>LIVE_CHAT + contact assoc]
+    O --> P[Associate comm → workspace<br/>via batchCreateAssociations]
+    P --> Q[Update hubspot_communication_id]
+    J --> R[Update conversation counters]
+    C -->|All done| S[Update cursor]
+    S --> T{{Slack: script_logs recap<br/>Messages + HubSpot stats}}
+```
+
+### `backfill-crisp-hubspot` (manual)
+
+```mermaid
+flowchart TD
+    A([Manual trigger]) --> B[Load operator mapping]
+    B --> C[Fetch tchat_messages<br/>hubspot_communication_id IS NULL<br/>content_type = text<br/>JOIN contact_email]
+    C --> D{For each message}
+    D --> E[findHubSpotContactByEmail<br/>cached per email]
+    E -->|Not found| F[Skip]
+    E -->|Found| G[POST HubSpot communication<br/>LIVE_CHAT + contact + workspace]
+    G --> H[Update hubspot_communication_id]
+    D -->|Batch done| I{More messages?}
+    I -->|Yes| J[Self-trigger next batch]
+    I -->|No| K{{Slack: script_logs recap}}
 ```
 
 ### `import-circle-posts` (weekly Friday 8h)
@@ -710,6 +735,7 @@ flowchart TD
 ### `workspace_team`
 - Maps `ghost_genius_account_id` → `unipile_account_id`
 - Contains LinkedIn URLs and team member info
+- `crisp_operator_id`: Crisp user_id for operator → HubSpot owner mapping (used by `sync-crisp-to-supabase`)
 
 ### `scrapped_connection`
 - 1st-degree LinkedIn connections (from `get-team-connections`)
@@ -849,6 +875,7 @@ flowchart TD
 - `content_type`: text, file, note, etc.
 - `crisp_timestamp`: original Crisp timestamp
 - `raw_data`: full Crisp message object
+- `hubspot_communication_id`: HubSpot communication ID (set after LIVE_CHAT sync for text messages with contact email match, null otherwise)
 
 ### `tchat_sync_cursor`
 - **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)

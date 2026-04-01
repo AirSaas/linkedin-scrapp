@@ -145,6 +145,24 @@ export async function insertMessagesBatch(
 }
 
 // ============================================
+// HubSpot communication ID update
+// ============================================
+
+export async function updateCrispMessageHubSpotId(
+  fingerprint: string,
+  hubspotCommunicationId: string
+): Promise<void> {
+  const { error } = await getCrispSupabase()
+    .from("tchat_messages")
+    .update({ hubspot_communication_id: hubspotCommunicationId })
+    .eq("fingerprint", fingerprint);
+
+  if (error) {
+    logger.error(`Failed to update hubspot_communication_id for ${fingerprint}: ${error.message}`);
+  }
+}
+
+// ============================================
 // Compteurs conversation
 // ============================================
 

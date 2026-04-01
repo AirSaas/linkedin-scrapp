@@ -10,9 +10,15 @@ import {
   messageExists,
   insertMessage,
   updateConversationCounters,
+  updateCrispMessageHubSpotId,
   getCursor,
   updateCursor,
 } from "./lib/crisp-supabase.js";
+import {
+  findHubSpotContactByEmail,
+  sendCrispMessageToHubSpot,
+} from "./lib/hubspot.js";
+import { getSupabase } from "./lib/supabase.js";
 import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
 
 /**
@@ -44,8 +50,33 @@ export const syncCrispToSupabase = schedules.task({
 
       let totalNewMessages = 0;
       let totalConversations = 0;
+      let hubspotSent = 0;
+      let hubspotNoMatch = 0;
+      let hubspotSkippedNoEmail = 0;
+      let hubspotSkippedNonText = 0;
+      const noEmailSessions: string[] = [];
       let latestTimestamp = cursorDate;
       let page = 1;
+
+      // Build operator mapping: crisp_operator_id → hubspot_id
+      const operatorMap = new Map<string, string>();
+      try {
+        const { data: team } = await getSupabase()
+          .from("workspace_team")
+          .select("crisp_operator_id, hubspot_id")
+          .not("crisp_operator_id", "is", null);
+        for (const row of team ?? []) {
+          if (row.crisp_operator_id && row.hubspot_id) {
+            operatorMap.set(row.crisp_operator_id, row.hubspot_id);
+          }
+        }
+        logger.info(`Operator mapping: ${operatorMap.size} entries`);
+      } catch (err) {
+        logger.warn(`Failed to load operator mapping: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // Cache: email → contactId (avoid redundant HubSpot searches)
+      const contactCache = new Map<string, string | null>();
 
       while (page <= 10) {
         const conversations = await listConversations(page);
@@ -85,12 +116,59 @@ export const syncCrispToSupabase = schedules.task({
               if (inserted) {
                 newInThisConvo++;
                 totalNewMessages++;
+
+                // HubSpot sync: only text messages with contact email
+                if (msg.type !== "text") {
+                  hubspotSkippedNonText++;
+                } else if (!meta?.email) {
+                  hubspotSkippedNoEmail++;
+                } else {
+                  try {
+                    // Resolve contact (cached)
+                    let contactId = contactCache.get(meta.email);
+                    if (contactId === undefined) {
+                      const contact = await findHubSpotContactByEmail(meta.email);
+                      contactId = contact?.id ?? null;
+                      contactCache.set(meta.email, contactId);
+                      await sleep(150);
+                    }
+
+                    if (!contactId) {
+                      hubspotNoMatch++;
+                    } else {
+                      const direction = msg.from === "user" ? "INBOUND" as const : "OUTBOUND" as const;
+                      const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+                      const hubspotOwnerId = msg.user?.user_id ? operatorMap.get(msg.user.user_id) ?? null : null;
+
+                      const hsCommId = await sendCrispMessageToHubSpot({
+                        content,
+                        timestamp: new Date(msg.timestamp).toISOString(),
+                        direction,
+                        contactId,
+                        hubspotOwnerId,
+                      });
+
+                      if (hsCommId) {
+                        await updateCrispMessageHubSpotId(fingerprint, hsCommId);
+                        hubspotSent++;
+                      }
+                    }
+                  } catch (err) {
+                    const m = err instanceof Error ? err.message : String(err);
+                    errors.push({ type: "HubSpot", code: "exception", message: `${sessionId}: ${m}` });
+                  }
+                }
               }
             }
 
             if (newInThisConvo > 0) {
               await updateConversationCounters(sessionId);
               logger.info(`  ${sessionId}: +${newInThisConvo} nouveaux msgs`);
+
+              // Track conversations with new messages but no email (for Slack alert)
+              if (!meta?.email) {
+                noEmailSessions.push(`${sessionId} (${meta?.nickname ?? "unknown"})`);
+              }
             }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -115,12 +193,27 @@ export const syncCrispToSupabase = schedules.task({
         });
       }
 
-      await sendErrorToScriptLogs("Sync Crisp → Supabase", [{
-        label: "Messages",
-        inserted: totalNewMessages,
-        skipped: 0,
-        errors,
-      }]);
+      const hubspotErrors = errors.filter((e) => e.type === "HubSpot");
+      const otherErrors = errors.filter((e) => e.type !== "HubSpot");
+
+      await sendErrorToScriptLogs("Sync Crisp → Supabase", [
+        {
+          label: "Messages",
+          inserted: totalNewMessages,
+          skipped: 0,
+          errors: otherErrors,
+        },
+        {
+          label: "HubSpot",
+          inserted: hubspotSent,
+          skipped: hubspotNoMatch + hubspotSkippedNoEmail + hubspotSkippedNonText,
+          errors: hubspotErrors,
+        },
+      ]);
+
+      if (noEmailSessions.length > 0) {
+        logger.warn(`Conversations sans email (${noEmailSessions.length}): ${noEmailSessions.join(", ")}`);
+      }
 
       const duration = Math.round((Date.now() - startTime) / 1000);
 
