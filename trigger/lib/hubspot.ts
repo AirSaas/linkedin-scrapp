@@ -1,5 +1,10 @@
 import { logger } from "@trigger.dev/sdk/v3";
 import { sleep } from "./utils.js";
+import {
+  batchGetContactWorkspaces,
+  batchCreateAssociations,
+  COMMUNICATION_TYPE_ID,
+} from "./hubspot-workspace.js";
 
 const HUBSPOT_API_BASE = "https://api.hubapi.com";
 const HUBSPOT_429_PAUSE = 10000;
@@ -73,6 +78,32 @@ export async function findHubSpotContact(
               propertyName: "linkedinprofileurn",
               operator: "EQ",
               value: linkedinUrn,
+            },
+          ],
+        },
+      ],
+      limit: 1,
+    }
+  );
+
+  const results = (response.results ?? []) as { id: string }[];
+  return results.length > 0 ? results[0] : null;
+}
+
+export async function findHubSpotContactByEmail(
+  email: string
+): Promise<{ id: string } | null> {
+  const response = await callHubSpot(
+    `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/search`,
+    "POST",
+    {
+      filterGroups: [
+        {
+          filters: [
+            {
+              propertyName: "email",
+              operator: "EQ",
+              value: email,
             },
           ],
         },
@@ -221,4 +252,69 @@ export async function sendMessageToHubSpot(
   }
   await sleep(BETWEEN_HUBSPOT_CALLS);
   return hsId ?? null;
+}
+
+/**
+ * Create a HubSpot communication for a Crisp support chat message.
+ * Associates to contact + workspace(s). Returns communication ID or null.
+ */
+export async function sendCrispMessageToHubSpot(params: {
+  content: string;
+  timestamp: string;
+  direction: "INBOUND" | "OUTBOUND";
+  contactId: string;
+  hubspotOwnerId?: string | null;
+}): Promise<string | null> {
+  const { content, timestamp, direction, contactId, hubspotOwnerId } = params;
+
+  const directionLabel = direction === "INBOUND" ? "Inbound" : "Outbound";
+  const communicationBody = `${directionLabel}: ${content}`;
+
+  const contactAssociation = {
+    to: { id: contactId },
+    types: [
+      { associationCategory: "HUBSPOT_DEFINED", associationTypeId: 81 },
+    ],
+  };
+
+  const properties: Record<string, string> = {
+    hs_communication_channel_type: "LIVE_CHAT",
+    hs_communication_logged_from: "CRM",
+    hs_communication_body: communicationBody,
+    hs_timestamp: timestamp,
+  };
+  if (hubspotOwnerId) {
+    properties.hubspot_owner_id = hubspotOwnerId;
+  }
+
+  const response = await callHubSpot(
+    `${HUBSPOT_API_BASE}/crm/v3/objects/communications`,
+    "POST",
+    { properties, associations: [contactAssociation] }
+  );
+  await sleep(BETWEEN_HUBSPOT_CALLS);
+
+  const hsId = response.id as string | undefined;
+  if (!hsId) return null;
+
+  logger.info(
+    `HubSpot LIVE_CHAT created: ${hsId} (${directionLabel}) for contact ${contactId}`
+  );
+
+  // Associate communication → workspace(s) via contact's workspaces
+  try {
+    const contactWorkspaces = await batchGetContactWorkspaces([contactId]);
+    const wsIds = contactWorkspaces.get(contactId) ?? [];
+
+    if (wsIds.length > 0) {
+      const pairs = wsIds.map((wsId) => ({ fromId: hsId, toId: wsId }));
+      await batchCreateAssociations(COMMUNICATION_TYPE_ID, pairs);
+      logger.info(`  → associated to ${wsIds.length} workspace(s)`);
+    }
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    logger.warn(`Workspace association failed for comm ${hsId}: ${m}`);
+  }
+
+  return hsId;
 }
