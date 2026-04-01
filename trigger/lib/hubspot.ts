@@ -278,7 +278,7 @@ export async function sendCrispMessageToHubSpot(params: {
   };
 
   const properties: Record<string, string> = {
-    hs_communication_channel_type: "LIVE_CHAT",
+    hs_communication_channel_type: "CUSTOM_CHANNEL_CONVERSATION",
     hs_communication_logged_from: "CRM",
     hs_communication_body: communicationBody,
     hs_timestamp: timestamp,
@@ -298,7 +298,7 @@ export async function sendCrispMessageToHubSpot(params: {
   if (!hsId) return null;
 
   logger.info(
-    `HubSpot LIVE_CHAT created: ${hsId} (${directionLabel}) for contact ${contactId}`
+    `HubSpot CUSTOM_CHANNEL created: ${hsId} (${directionLabel}) for contact ${contactId}`
   );
 
   // Associate communication → workspace(s) via contact's workspaces
