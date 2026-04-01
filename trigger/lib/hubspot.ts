@@ -268,7 +268,7 @@ export async function sendCrispMessageToHubSpot(params: {
   const { content, timestamp, direction, contactId, hubspotOwnerId } = params;
 
   const directionLabel = direction === "INBOUND" ? "Inbound" : "Outbound";
-  const communicationBody = `${directionLabel}: ${content}`;
+  const communicationBody = `[tchat_support] ${directionLabel}: ${content}`;
 
   const contactAssociation = {
     to: { id: contactId },
