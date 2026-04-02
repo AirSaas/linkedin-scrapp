@@ -37,7 +37,7 @@ const ACTIVE_DEAL_STAGES = new Set([
 // ============================================
 // TYPES
 // ============================================
-interface PrcActivity {
+export interface PrcActivity {
   CONTACT_HUBSPOT_ID?: string;
   CONTACT_FULL_NAME?: string;
   CONTACT?: string | Record<string, unknown>;
@@ -55,7 +55,7 @@ interface PrcActivity {
   _airbyte_generation_id?: number;
 }
 
-interface Deal {
+export interface Deal {
   deal_hubspot_id?: string;
   deal_name?: string;
   deal_stage?: string;
@@ -66,7 +66,7 @@ interface Deal {
   is_deal_ia_agent_activated?: boolean;
 }
 
-interface ContactPayload {
+export interface ContactPayload {
   contact_info: {
     hubspot_id: string;
     full_name: string | null;
@@ -395,7 +395,7 @@ export const sendContactsToLanggraphTask = schedules.task({
 // ============================================
 // OWNER RESOLUTION
 // ============================================
-function getContactOwner(
+export function getContactOwner(
   activities: PrcActivity[]
 ): { id: string; name: string } | null {
   for (const activity of activities) {
@@ -415,7 +415,7 @@ function getContactOwner(
 // ============================================
 // ACTIVE DEAL CHECK
 // ============================================
-function hasActiveDeal(activities: PrcActivity[]): boolean {
+export function hasActiveDeal(activities: PrcActivity[]): boolean {
   for (const activity of activities) {
     const deals = parseJsonField(activity.DEALS) as Deal[] | null;
     if (!Array.isArray(deals)) continue;
@@ -463,7 +463,7 @@ async function fetchAllActivities(): Promise<PrcActivity[]> {
 // ============================================
 // JSON BUILDER (mirrors GAS buildContactJson)
 // ============================================
-function parseJsonField(field: unknown): Record<string, unknown> | unknown[] | null {
+export function parseJsonField(field: unknown): Record<string, unknown> | unknown[] | null {
   if (!field) return null;
   if (typeof field === "string") {
     try {
@@ -476,7 +476,7 @@ function parseJsonField(field: unknown): Record<string, unknown> | unknown[] | n
   return null;
 }
 
-function deduplicateActivities(activities: PrcActivity[]): PrcActivity[] {
+export function deduplicateActivities(activities: PrcActivity[]): PrcActivity[] {
   const uniqueMap: Record<string, PrcActivity> = {};
 
   for (const activity of activities) {
@@ -494,7 +494,7 @@ function deduplicateActivities(activities: PrcActivity[]): PrcActivity[] {
   return Object.values(uniqueMap);
 }
 
-function buildContactPayload(
+export function buildContactPayload(
   contactId: string,
   activities: PrcActivity[]
 ): ContactPayload {
@@ -574,7 +574,7 @@ function buildContactPayload(
 // ============================================
 // LANGGRAPH API
 // ============================================
-async function sendToLangGraph(
+export async function sendToLangGraph(
   payload: ContactPayload
 ): Promise<{
   success: boolean;
@@ -625,7 +625,7 @@ async function sendToLangGraph(
 // ============================================
 // SUPABASE LOGGING
 // ============================================
-interface LogSendParams {
+export interface LogSendParams {
   runId: string;
   contactId: string;
   payload: ContactPayload;
@@ -637,7 +637,7 @@ interface LogSendParams {
   errorMessage: string | null;
 }
 
-async function logSend(
+export async function logSend(
   sb: ReturnType<typeof getAiAeSdrSupabase>,
   params: LogSendParams
 ): Promise<void> {

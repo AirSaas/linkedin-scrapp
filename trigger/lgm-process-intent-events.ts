@@ -39,15 +39,15 @@ const EXCLUDED_LINKEDIN_PROFILES = [
 const AUDIENCE_MAPPING: Record<string, string | null> = {
   // THOMAS_POITAU
   "thomas_poitau|Reaction|connected_false":
-    "thomas_poitau_warm_leads_connected_false_q1_2025",
+    "thomas_poitau_warm_leads_connected_false_q2_2026",
   "thomas_poitau|Comment|connected_false":
-    "thomas_poitau_warm_leads_connected_false_q1_2025",
+    "thomas_poitau_warm_leads_connected_false_q2_2026",
   "thomas_poitau|Visit Profile|connected_false":
-    "thomas_poitau_warm_leads_connected_false_q1_2025",
+    "thomas_poitau_warm_leads_connected_false_q2_2026",
   "thomas_poitau|Follow Team Member|connected_false":
-    "thomas_poitau_warm_leads_connected_false_q1_2025",
+    "thomas_poitau_warm_leads_connected_false_q2_2026",
   "thomas_poitau|Connect|connected_false":
-    "thomas_poitau_warm_leads_connected_false_q1_2025",
+    "thomas_poitau_warm_leads_connected_false_q2_2026",
   "thomas_poitau|Reaction|connected_true": "HUBSPOT",
   "thomas_poitau|Comment|connected_true": "HUBSPOT",
   "thomas_poitau|Visit Profile|connected_true": "HUBSPOT",
@@ -56,15 +56,15 @@ const AUDIENCE_MAPPING: Record<string, string | null> = {
 
   // BERTRAN_RUIZ
   "bertran_ruiz|Reaction|connected_false":
-    "bertran_ruiz_warm_leads_connected_false_q1_2025",
+    "bertran_ruiz_warm_leads_connected_false_q2_2026",
   "bertran_ruiz|Comment|connected_false":
-    "bertran_ruiz_warm_leads_connected_false_q1_2025",
+    "bertran_ruiz_warm_leads_connected_false_q2_2026",
   "bertran_ruiz|Visit Profile|connected_false":
-    "bertran_ruiz_warm_leads_connected_false_q1_2025",
+    "bertran_ruiz_warm_leads_connected_false_q2_2026",
   "bertran_ruiz|Follow Team Member|connected_false":
-    "bertran_ruiz_warm_leads_connected_false_q1_2025",
+    "bertran_ruiz_warm_leads_connected_false_q2_2026",
   "bertran_ruiz|Connect|connected_false":
-    "bertran_ruiz_warm_leads_connected_false_q1_2025",
+    "bertran_ruiz_warm_leads_connected_false_q2_2026",
   "bertran_ruiz|Reaction|connected_true": "HUBSPOT",
   "bertran_ruiz|Comment|connected_true": "HUBSPOT",
   "bertran_ruiz|Visit Profile|connected_true": "HUBSPOT",
@@ -73,15 +73,15 @@ const AUDIENCE_MAPPING: Record<string, string | null> = {
 
   // SIMON_VACHER
   "simon_vacher|Reaction|connected_false":
-    "simon_vacher_warm_leads_connected_false_q1_2025",
+    "simon_vacher_warm_leads_connected_false_q2_2026",
   "simon_vacher|Comment|connected_false":
-    "simon_vacher_warm_leads_connected_false_q1_2025",
+    "simon_vacher_warm_leads_connected_false_q2_2026",
   "simon_vacher|Visit Profile|connected_false":
-    "simon_vacher_warm_leads_connected_false_q1_2025",
+    "simon_vacher_warm_leads_connected_false_q2_2026",
   "simon_vacher|Follow Team Member|connected_false":
-    "simon_vacher_warm_leads_connected_false_q1_2025",
+    "simon_vacher_warm_leads_connected_false_q2_2026",
   "simon_vacher|Connect|connected_false":
-    "simon_vacher_warm_leads_connected_false_q1_2025",
+    "simon_vacher_warm_leads_connected_false_q2_2026",
   "simon_vacher|Reaction|connected_true": "HUBSPOT",
   "simon_vacher|Comment|connected_true": "HUBSPOT",
   "simon_vacher|Visit Profile|connected_true": "HUBSPOT",
