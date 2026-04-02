@@ -2,6 +2,7 @@ import { logger, schedules } from "@trigger.dev/sdk/v3";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { sleep, sendErrorToScriptLogs, type TaskError } from "./lib/utils.js";
+import { getSupabase } from "./lib/supabase.js";
 
 // ============================================
 // CONFIGURATION
@@ -47,6 +48,7 @@ interface ConversationMessage {
   content_type: string;
   crisp_timestamp: string;
   operator_name: string | null;
+  operator_id: string | null;
   text: string;
 }
 
@@ -54,14 +56,22 @@ interface ClassifiedConversation extends ActiveConversation {
   subject: string;
   type: "bug" | "question" | "feature_request" | "config" | "other";
   waiting_on: "support" | "client" | "resolved";
+  close_suggestion: string | null;
   last_message_direction: string;
   messages: ConversationMessage[];
+}
+
+interface ThemeAnalysis {
+  theme: string;
+  count: number;
+  summary: string;
 }
 
 interface OperatorStats {
   name: string;
   messageCount: number;
   conversationCount: number;
+  toCloseCount: number;
 }
 
 // ============================================
@@ -76,12 +86,12 @@ export const weeklyCrispRecapTask = schedules.task({
     const errors: TaskError[] = [];
 
     try {
-      // Step 1 — Period: dimanche 00h → vendredi 8h30 (Europe/Paris)
-      const { sundayISO, fridayISO, weekLabel } = getWeekBounds();
-      logger.info(`Period: ${weekLabel} (${sundayISO} → ${fridayISO})`);
+      // Step 1 — Period: vendredi dernier 00h → maintenant (Europe/Paris)
+      const { startISO, endISO, weekLabel } = getWeekBounds();
+      logger.info(`Period: ${weekLabel} (${startISO} → ${endISO})`);
 
       // Step 2 — Fetch active conversations
-      const conversations = await fetchActiveConversations(sundayISO, fridayISO);
+      const conversations = await fetchActiveConversations(startISO, endISO);
       logger.info(`${conversations.length} active conversations`);
 
       if (conversations.length === 0) {
@@ -92,15 +102,15 @@ export const weeklyCrispRecapTask = schedules.task({
       // Step 3 — Fetch messages for active conversations
       const messagesMap = await fetchWeekMessages(
         conversations.map((c) => c.session_id),
-        sundayISO,
-        fridayISO
+        startISO,
+        endISO
       );
       logger.info(`Messages fetched for ${messagesMap.size} conversations`);
 
-      // Step 4 — Compute operator stats from messages
-      const operatorStats = computeOperatorStats(messagesMap);
+      // Step 3b — Load operator name mapping from workspace_team
+      const operatorNameMap = await loadOperatorNameMap();
 
-      // Step 5 — Compute basic stats
+      // Step 4 — Compute basic stats + avg response time
       const newConversations = conversations.filter((c) => c.is_new);
       const resolvedConversations = conversations.filter((c) => c.state === "resolved");
       let totalInbound = 0;
@@ -111,20 +121,29 @@ export const weeklyCrispRecapTask = schedules.task({
           else if (m.direction === "OUTBOUND") totalOutbound++;
         }
       }
+      const avgResponseMinutes = computeAvgResponseTime(messagesMap);
 
-      // Step 6 — AI classification of conversations
+      // Step 5 — AI classification of conversations
       const classified = await classifyConversations(conversations, messagesMap, errors);
       logger.info(`AI classified ${classified.length} conversations`);
 
-      // Step 7 — Build and send Slack message
+      // Step 6 — Compute operator stats (needs classified for toCloseCount)
+      const operatorStats = computeOperatorStats(messagesMap, classified, operatorNameMap);
+
+      // Step 7 — AI global themes analysis
+      const themes = await analyzeGlobalThemes(classified, errors);
+      logger.info(`${themes.length} themes identified`);
+
+      // Step 8 — Build and send Slack message
       const stats = {
         active: conversations.length,
         new: newConversations.length,
         resolved: resolvedConversations.length,
         totalInbound,
         totalOutbound,
+        avgResponseMinutes,
       };
-      await sendSlackRecap(weekLabel, classified, stats, operatorStats);
+      await sendSlackRecap(weekLabel, classified, stats, operatorStats, themes);
 
       // Error reporting
       if (errors.length > 0) {
@@ -186,26 +205,21 @@ function getWeekBounds() {
   const weekdayName = parts.find((p) => p.type === "weekday")!.value.toLowerCase();
   const dayOfWeek = weekdayMap[weekdayName] ?? 0;
 
-  // Sunday = start of period
-  const diffToSunday = dayOfWeek === 0 ? 0 : -dayOfWeek;
+  // Last Friday 00:00 = start of period (7 days ago if today is Friday)
+  const diffToLastFriday = dayOfWeek >= 5
+    ? -(dayOfWeek - 5) - 7
+    : -(dayOfWeek + 2);
   const todayUTC = new Date(Date.UTC(year, month - 1, day));
-  const sundayUTC = new Date(todayUTC);
-  sundayUTC.setUTCDate(sundayUTC.getUTCDate() + diffToSunday);
-
-  const fridayUTC = new Date(sundayUTC);
-  fridayUTC.setUTCDate(fridayUTC.getUTCDate() + 5);
+  const lastFridayUTC = new Date(todayUTC);
+  lastFridayUTC.setUTCDate(lastFridayUTC.getUTCDate() + diffToLastFriday);
 
   const pad = (n: number) => String(n).padStart(2, "0");
-  const sundayISO = `${sundayUTC.getUTCFullYear()}-${pad(sundayUTC.getUTCMonth() + 1)}-${pad(sundayUTC.getUTCDate())}T00:00:00.000Z`;
-  const fridayISO = `${fridayUTC.getUTCFullYear()}-${pad(fridayUTC.getUTCMonth() + 1)}-${pad(fridayUTC.getUTCDate())}T08:30:00.000Z`;
+  const startISO = `${lastFridayUTC.getUTCFullYear()}-${pad(lastFridayUTC.getUTCMonth() + 1)}-${pad(lastFridayUTC.getUTCDate())}T00:00:00.000Z`;
+  const endISO = `${todayUTC.getUTCFullYear()}-${pad(todayUTC.getUTCMonth() + 1)}-${pad(todayUTC.getUTCDate())}T08:30:00.000Z`;
 
-  const monthNames = [
-    "janvier", "février", "mars", "avril", "mai", "juin",
-    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
-  ];
-  const weekLabel = `Semaine du ${sundayUTC.getUTCDate()} ${monthNames[sundayUTC.getUTCMonth()]} ${sundayUTC.getUTCFullYear()}`;
+  const weekLabel = `Vendredi ${pad(lastFridayUTC.getUTCDate())}/${pad(lastFridayUTC.getUTCMonth() + 1)} — Vendredi ${pad(todayUTC.getUTCDate())}/${pad(todayUTC.getUTCMonth() + 1)}`;
 
-  return { sundayISO, fridayISO, weekLabel };
+  return { startISO, endISO, weekLabel };
 }
 
 // ============================================
@@ -213,28 +227,28 @@ function getWeekBounds() {
 // ============================================
 
 async function fetchActiveConversations(
-  sundayISO: string,
-  fridayISO: string
+  startISO: string,
+  endISO: string
 ): Promise<ActiveConversation[]> {
   const { data, error } = await db()
     .from("tchat_conversations")
     .select("session_id, contact_name, contact_email, state, first_message_at, last_message_at, message_count_inbound, message_count_outbound")
-    .gte("last_message_at", sundayISO)
-    .lte("last_message_at", fridayISO)
+    .gte("last_message_at", startISO)
+    .lte("last_message_at", endISO)
     .order("last_message_at", { ascending: false });
 
   if (error) throw new Error(`Supabase conversations: ${error.message}`);
 
   return (data ?? []).map((c: any) => ({
     ...c,
-    is_new: c.first_message_at >= sundayISO,
+    is_new: c.first_message_at >= startISO,
   }));
 }
 
 async function fetchWeekMessages(
   sessionIds: string[],
-  sundayISO: string,
-  fridayISO: string
+  startISO: string,
+  endISO: string
 ): Promise<Map<string, ConversationMessage[]>> {
   const result = new Map<string, ConversationMessage[]>();
 
@@ -246,8 +260,8 @@ async function fetchWeekMessages(
       .from("tchat_messages")
       .select("session_id, direction, content_type, crisp_timestamp, raw_data")
       .in("session_id", chunk)
-      .gte("crisp_timestamp", sundayISO)
-      .lte("crisp_timestamp", fridayISO)
+      .gte("crisp_timestamp", startISO)
+      .lte("crisp_timestamp", endISO)
       .order("crisp_timestamp", { ascending: true });
 
     if (error) throw new Error(`Supabase messages: ${error.message}`);
@@ -255,6 +269,7 @@ async function fetchWeekMessages(
     for (const msg of data ?? []) {
       const raw = msg.raw_data ?? {};
       const operatorName = raw?.user?.nickname ?? null;
+      const operatorId = raw?.user?.user_id ?? null;
       const text = typeof raw?.content === "string"
         ? raw.content
         : raw?.content?.text ?? raw?.content?.url ?? "";
@@ -265,6 +280,7 @@ async function fetchWeekMessages(
         content_type: msg.content_type,
         crisp_timestamp: msg.crisp_timestamp,
         operator_name: operatorName,
+        operator_id: operatorId,
         text: text.substring(0, 500),
       };
 
@@ -278,32 +294,120 @@ async function fetchWeekMessages(
 }
 
 // ============================================
+// OPERATOR NAME MAPPING
+// ============================================
+
+async function loadOperatorNameMap(): Promise<Map<string, string>> {
+  const nameMap = new Map<string, string>();
+  try {
+    const { data } = await getSupabase()
+      .from("workspace_team")
+      .select("crisp_operator_id, firstname, lastname")
+      .not("crisp_operator_id", "is", null);
+    for (const row of data ?? []) {
+      if (row.crisp_operator_id && row.firstname) {
+        nameMap.set(row.crisp_operator_id, `${row.firstname} ${row.lastname ?? ""}`.trim());
+      }
+    }
+    logger.info(`Operator name mapping: ${nameMap.size} entries`);
+  } catch (err) {
+    logger.warn(`Failed to load operator name mapping: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return nameMap;
+}
+
+// ============================================
 // OPERATOR STATS
 // ============================================
 
 function computeOperatorStats(
-  messagesMap: Map<string, ConversationMessage[]>
+  messagesMap: Map<string, ConversationMessage[]>,
+  classified: ClassifiedConversation[],
+  operatorNameMap: Map<string, string>
 ): OperatorStats[] {
-  const stats = new Map<string, { messageCount: number; sessions: Set<string> }>();
+  // Group by operator_id (fallback to operator_name if no id)
+  const stats = new Map<string, { name: string; messageCount: number; sessions: Set<string> }>();
 
   for (const [sessionId, messages] of messagesMap) {
     for (const msg of messages) {
-      if (msg.direction !== "OUTBOUND" || !msg.operator_name) continue;
-      const name = msg.operator_name;
-      const existing = stats.get(name) ?? { messageCount: 0, sessions: new Set() };
+      if (msg.direction !== "OUTBOUND" || (!msg.operator_id && !msg.operator_name)) continue;
+      const key = msg.operator_id ?? msg.operator_name!;
+      const displayName = (msg.operator_id && operatorNameMap.get(msg.operator_id)) ?? msg.operator_name ?? key;
+      const existing = stats.get(key) ?? { name: displayName, messageCount: 0, sessions: new Set() };
       existing.messageCount++;
       existing.sessions.add(sessionId);
-      stats.set(name, existing);
+      stats.set(key, existing);
+    }
+  }
+
+  // Find conversations to close: AI says resolved but Crisp state is still open
+  const toCloseBySession = new Set(
+    classified
+      .filter((c) => c.waiting_on === "resolved" && c.state !== "resolved")
+      .map((c) => c.session_id)
+  );
+
+  // Attribute to-close conversations to the last operator who replied
+  const lastOperatorBySession = new Map<string, string>();
+  for (const [sessionId, messages] of messagesMap) {
+    for (const msg of messages) {
+      if (msg.direction === "OUTBOUND" && (msg.operator_id || msg.operator_name)) {
+        lastOperatorBySession.set(sessionId, msg.operator_id ?? msg.operator_name!);
+      }
+    }
+  }
+
+  const toClosePerOperator = new Map<string, number>();
+  for (const sessionId of toCloseBySession) {
+    const operatorKey = lastOperatorBySession.get(sessionId);
+    if (operatorKey) {
+      toClosePerOperator.set(operatorKey, (toClosePerOperator.get(operatorKey) ?? 0) + 1);
     }
   }
 
   return Array.from(stats.entries())
-    .map(([name, s]) => ({
-      name,
+    .map(([key, s]) => ({
+      name: s.name,
       messageCount: s.messageCount,
       conversationCount: s.sessions.size,
+      toCloseCount: toClosePerOperator.get(key) ?? 0,
     }))
     .sort((a, b) => b.messageCount - a.messageCount);
+}
+
+// ============================================
+// AVERAGE RESPONSE TIME
+// ============================================
+
+function computeAvgResponseTime(
+  messagesMap: Map<string, ConversationMessage[]>
+): number | null {
+  const deltas: number[] = [];
+
+  for (const messages of messagesMap.values()) {
+    let awaitingResponseSince: number | null = null;
+
+    for (const msg of messages) {
+      const ts = new Date(msg.crisp_timestamp).getTime();
+      if (msg.direction === "INBOUND") {
+        if (awaitingResponseSince === null) awaitingResponseSince = ts;
+      } else if (msg.direction === "OUTBOUND" && awaitingResponseSince !== null) {
+        deltas.push((ts - awaitingResponseSince) / 60000);
+        awaitingResponseSince = null;
+      }
+    }
+  }
+
+  if (deltas.length === 0) return null;
+  return Math.round(deltas.reduce((a, b) => a + b, 0) / deltas.length);
+}
+
+function formatResponseTime(minutes: number | null): string {
+  if (minutes === null) return "N/A";
+  if (minutes < 60) return `${minutes}min`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m > 0 ? `${h}h ${m}min` : `${h}h`;
 }
 
 // ============================================
@@ -324,9 +428,13 @@ Pour chaque conversation, détermine :
    - "support" : le dernier message est du client, l'équipe doit répondre
    - "client" : le dernier message est du support, on attend la réponse du client
    - "resolved" : la conversation est marquée comme résolue
+4. "close_suggestion" : si la conversation N'EST PAS resolved (state != "resolved"), indique si elle devrait être fermée :
+   - "oui — [raison courte]" si le sujet semble clos (client a remercié, problème résolu, pas de réponse depuis longtemps)
+   - "non — [raison courte]" si le sujet est encore ouvert ou attend une action
+   - null si la conversation est déjà resolved
 
 Réponds UNIQUEMENT en JSON valide, sans markdown ni backticks :
-[{ "session_id": "...", "subject": "...", "type": "...", "waiting_on": "..." }]`;
+[{ "session_id": "...", "subject": "...", "type": "...", "waiting_on": "...", "close_suggestion": "..." }]`;
 
 async function classifyConversations(
   conversations: ActiveConversation[],
@@ -364,6 +472,7 @@ async function classifyConversations(
           waiting_on: conv.state === "resolved"
             ? "resolved"
             : lastMsg?.direction === "INBOUND" ? "support" : "client",
+          close_suggestion: null,
           last_message_direction: lastMsg?.direction ?? "unknown",
           messages,
         });
@@ -419,6 +528,7 @@ async function classifyBatch(
     subject: string;
     type: ClassifiedConversation["type"];
     waiting_on: ClassifiedConversation["waiting_on"];
+    close_suggestion: string | null;
   }[];
 
   const classMap = new Map(parsed.map((p) => [p.session_id, p]));
@@ -431,10 +541,61 @@ async function classifyBatch(
       subject: cls?.subject ?? conv.contact_name ?? "—",
       type: cls?.type ?? "other",
       waiting_on: cls?.waiting_on ?? (conv.state === "resolved" ? "resolved" : "support"),
+      close_suggestion: cls?.close_suggestion ?? null,
       last_message_direction: lastMsg?.direction ?? "unknown",
       messages,
     };
   });
+}
+
+// ============================================
+// AI GLOBAL THEMES ANALYSIS
+// ============================================
+
+async function analyzeGlobalThemes(
+  classified: ClassifiedConversation[],
+  errors: TaskError[]
+): Promise<ThemeAnalysis[]> {
+  if (classified.length < 2) return [];
+
+  try {
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const summaries = classified.map((c) => ({
+      subject: c.subject,
+      type: c.type,
+      contact_name: c.contact_name,
+    }));
+
+    const response = await client.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      temperature: 0,
+      system: `Tu analyses les sujets de conversations de support client AirSaas (SaaS de gestion de portefeuille de projets) pour identifier les grandes tendances de la semaine.
+
+Identifie 3 à 5 thèmes principaux regroupant les conversations. Pour chaque thème :
+- "theme" : nom court du thème (3-5 mots)
+- "count" : nombre de conversations liées
+- "summary" : résumé en 1 phrase de ce que les clients demandent sur ce thème
+
+Réponds UNIQUEMENT en JSON valide, sans markdown ni backticks :
+[{ "theme": "...", "count": N, "summary": "..." }]`,
+      messages: [{
+        role: "user",
+        content: `Voici les ${classified.length} conversations de la semaine :\n\n${JSON.stringify(summaries, null, 2)}`,
+      }],
+    });
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    if (!textBlock || textBlock.type !== "text") return [];
+
+    return JSON.parse(textBlock.text) as ThemeAnalysis[];
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`Themes analysis error: ${msg}`);
+    errors.push({ type: "AI Themes", code: "exception", message: msg });
+    return [];
+  }
 }
 
 // ============================================
@@ -469,8 +630,9 @@ function formatConversationLine(c: ClassifiedConversation): string {
 async function sendSlackRecap(
   weekLabel: string,
   classified: ClassifiedConversation[],
-  stats: { active: number; new: number; resolved: number; totalInbound: number; totalOutbound: number },
-  operatorStats: OperatorStats[]
+  stats: { active: number; new: number; resolved: number; totalInbound: number; totalOutbound: number; avgResponseMinutes: number | null },
+  operatorStats: OperatorStats[],
+  themes: ThemeAnalysis[]
 ): Promise<void> {
   let text = `📊 *Recap Support Crisp — ${weekLabel}*\n`;
 
@@ -478,12 +640,22 @@ async function sendSlackRecap(
   text += `\n🔢 *Activité*\n`;
   text += `• ${stats.active} conversations actives (${stats.new} nouvelles, ${stats.resolved} résolues)\n`;
   text += `• ${stats.totalInbound} messages clients / ${stats.totalOutbound} réponses support\n`;
+  text += `• Temps de réponse moyen : ${formatResponseTime(stats.avgResponseMinutes)}\n`;
 
   // Operator stats
   if (operatorStats.length > 0) {
     text += `\n👥 *Opérateurs*\n`;
     for (const op of operatorStats) {
-      text += `• ${op.name}: ${op.messageCount} réponses (${op.conversationCount} conversations)\n`;
+      const closeStr = op.toCloseCount > 0 ? ` — ${op.toCloseCount} à fermer sur Crisp` : "";
+      text += `• ${op.name}: ${op.messageCount} réponses (${op.conversationCount} conversations)${closeStr}\n`;
+    }
+  }
+
+  // Global themes
+  if (themes.length > 0) {
+    text += `\n🎯 *Sujets de la semaine*\n`;
+    for (const t of themes) {
+      text += `• *${t.theme}* (${t.count}) — ${t.summary}\n`;
     }
   }
 
@@ -514,12 +686,24 @@ async function sendSlackRecap(
     }
   }
 
-  // Feature requests / questions
+  // Feature requests
   const featureRequests = classified.filter((c) => c.type === "feature_request" && c.waiting_on !== "resolved");
   if (featureRequests.length > 0) {
     text += `\n💡 *Demandes de fonctionnalités (${featureRequests.length})*\n`;
     for (const c of featureRequests) {
       text += formatConversationLine(c) + "\n";
+    }
+  }
+
+  // Close suggestions
+  const toClose = classified.filter((c) => c.close_suggestion?.startsWith("oui"));
+  if (toClose.length > 0) {
+    text += `\n🔒 *Conversations à fermer ? (${toClose.length})*\n`;
+    for (const c of toClose) {
+      const name = c.contact_name ?? "Anonyme";
+      const company = companyFromEmail(c.contact_email);
+      const companyStr = company ? ` (${company})` : "";
+      text += `• *${name}*${companyStr} — ${c.subject} — _${c.close_suggestion}_\n`;
     }
   }
 

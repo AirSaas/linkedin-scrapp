@@ -47,6 +47,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/generate-faq-document.ts` — manual task: reads `tchat_faq_extractions` (score >= 3), consolidates themes + deduplicates via Claude Opus in batches, generates structured Markdown FAQ document, saves to `tchat_faq_documents`
 - `trigger/audit-circle-documentation.ts` — manual task: cross-references FAQ extractions with Circle articles, produces audit report with article rewrites (image-preserving), new article drafts, and orphan detection. Resume support via `tchat_doc_audit_items`. Saves to `tchat_faq_documents` with type `doc_audit`
 - `trigger/propose-faq-updates.ts` — manual monthly task: compares recent Crisp extractions + Circle articles against approved FAQ reference, produces HTML proposal with new questions, answer updates (before/after diff), removals, and Circle article suggestions. 2-pass Opus architecture. Saves to `tchat_faq_documents` with type `faq_proposal`
+- `trigger/weekly-crisp-recap.ts` — weekly Friday 8h30 recap of Crisp support conversations (vendredi→vendredi). AI classification (type, subject, waiting_on, close_suggestion), global themes analysis, avg response time, operator stats. Posts to `webhook_crisp_recap`
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
 - `trigger/lib/supabase.ts` — Supabase client (lazy-init via Proxy)
 - `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
@@ -116,6 +117,8 @@ flowchart LR
     ACD --> SB_CR & SL
     SB_CR --> PFU[propose-faq-updates]
     PFU --> SB_CR & SL
+    SB_CR --> WCR[weekly-crisp-recap]
+    WCR --> SL
     WUR --> SL
 ```
 
@@ -653,6 +656,23 @@ flowchart TD
     L & M & N & O --> P[Assembler HTML<br/>diff coloré + TOC]
     P --> Q[Insert tchat_faq_documents<br/>type = faq_proposal]
     Q --> R{{Slack: script_logs}}
+```
+
+### `weekly-crisp-recap` (weekly Friday 8h30)
+
+```mermaid
+flowchart TD
+    A([Cron vendredi 8h30]) --> B[getWeekBounds<br/>vendredi dernier 00h → maintenant]
+    B --> C[Fetch tchat_conversations<br/>last_message_at dans la période]
+    C --> D{Conversations ?}
+    D -->|0| E{{Slack: webhook_crisp_recap<br/>aucune activité}}
+    D -->|> 0| F[Fetch tchat_messages<br/>par chunks de 20 session_ids]
+    F --> G[Compute stats:<br/>opérateurs, temps réponse moyen]
+    G --> H[AI Classification<br/>Claude Sonnet — batches de 10<br/>subject, type, waiting_on, close_suggestion]
+    H --> I[AI Thèmes globaux<br/>Claude Sonnet — 1 appel<br/>3-5 thèmes principaux]
+    I --> J[Build message Slack:<br/>stats + thèmes + bugs + attente<br/>+ feature requests + à fermer]
+    J --> K{{Slack: webhook_crisp_recap}}
+    H -->|Errors| L{{sendErrorToScriptLogs}}
 ```
 
 ## Important Rules
