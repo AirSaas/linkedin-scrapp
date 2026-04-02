@@ -80,6 +80,7 @@ interface OperatorStats {
 
 export const weeklyCrispRecapTask = schedules.task({
   id: "weekly-crisp-recap",
+  cron: "30 6 * * 5",
   maxDuration: 120,
   run: async () => {
     logger.info("=== START weekly-crisp-recap ===");
