@@ -340,10 +340,10 @@ function computeOperatorStats(
     }
   }
 
-  // Find conversations to close: AI says resolved but Crisp state is still open
+  // Find conversations to close: AI suggests closing AND Crisp state is still open
   const toCloseBySession = new Set(
     classified
-      .filter((c) => c.waiting_on === "resolved" && c.state !== "resolved")
+      .filter((c) => c.close_suggestion?.startsWith("oui") && c.state !== "resolved")
       .map((c) => c.session_id)
   );
 
