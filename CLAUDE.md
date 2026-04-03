@@ -54,6 +54,10 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/lib/crisp-supabase.ts` — Supabase client for tchat-support-sync project `oqiowupiczgrezgyopfm` (lazy-init, dedicated env vars)
 - `trigger/lib/circle-supabase.ts` — Supabase helpers for Circle posts sync (upsert posts, sync cursor) on tchat-support-sync project
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
+- `trigger/score-deal-forecast.ts` — pipeline de scoring AI des deals HubSpot : 8 signaux (0-4) + 6 red flags → score /32, zone ROUGE/ORANGE/VERT. Pousse vers HubSpot (13 propriétés ai_* + note timeline) et Supabase (deal_scoring). Prompts dans `trigger/prompts/deal-scoring/`
+- `trigger/prompts/deal-scoring/` — 12 prompts Markdown (8 signaux + 4 red flags) + contexte AirSaaS, lisibles directement sur GitHub
+- `trigger/lib/deal-scoring-prompts.ts` — prompts en template literals + types + configs signaux/red flags. Source of truth `.md`, miroir `.ts` pour le bundler esbuild
+- `trigger/lib/deal-scoring-hubspot.ts` — provisioning property group ai_forecast_scoring (13 propriétés), PATCH deal, note timeline
 
 ## Task Flow Diagrams
 
@@ -83,8 +87,8 @@ flowchart LR
     end
 
     UN --> GPV[get-profil-views] & GSC[get-strategic-connections] & GSP[get-strategic-people] & GTC[get-team-connections] & ILM[import-linkedin-messages] & IWM[import-whatsapp-messages]
-    SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph]
-    HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM & SWA[sync-workspace-activities]
+    SB --> LPI[lgm-process-intent-events] & DCA[deal-clean-alert] & DFC[data-freshness-check] & SCL[send-contacts-to-langgraph] & SDF[score-deal-forecast]
+    HS_I --> HCE[hubspot-cleanup-email-assoc] & WMR[weekly-meetings-recap] & LPI & ILM & SWA[sync-workspace-activities] & SDF
     MJ --> SMC[sync-modjo-calls]
     CR --> BCS[batch-crisp-to-supabase] & DBCS[daily-batch-crisp TMP] & SCS[sync-crisp-to-supabase]
     SB --> WUR[weekly-unanswered-recap]
@@ -106,6 +110,7 @@ flowchart LR
     DFC --> SL
     SMC --> SB_O & SL
     SCL --> LG & SL
+    SDF --> HS_O & SB_O & SL
     BCS --> SB_CR & SL
     DBCS --> SB_CR & SL
     SCS --> SB_CR & SL
@@ -675,6 +680,55 @@ flowchart TD
     H -->|Errors| L{{sendErrorToScriptLogs}}
 ```
 
+### `score-deal-forecast` (manual)
+
+```mermaid
+flowchart TD
+    A([Manuel: deal_urls]) --> B[Parse deal IDs<br/>regex /record\/0-3\/\d+/]
+    B --> C[ensureHubSpotProperties<br/>property group + 13 props<br/>idempotent — POST + catch 409]
+
+    C --> D{Pour chaque deal<br/>séquentiel}
+
+    D --> E[Promise.all — Fetch données]
+    E --> E1[Supabase: PRC_DEAL_ACTIVITIES<br/>WHERE DEAL_HUBSPOT_ID = dealId<br/>ORDER BY ACTIVITY_RECORDED_ON ASC]
+    E --> E2[Supabase: PRC_CONTACT_ACTIVITIES<br/>WHERE DEALS LIKE dealId<br/>enrichissement contacts]
+    E --> E3[HubSpot: GET deal<br/>propertiesWithHistory<br/>dealstage + closedate]
+
+    E1 & E2 & E3 --> F{Activités trouvées ?}
+    F -->|Non| G[Skip deal<br/>log erreur]
+    F -->|Oui| H[Formater activités + contacts<br/>pour LLM — truncation si >150K tokens]
+
+    H --> I[Promise.all — 8 prompts signal<br/>Claude Sonnet en parallèle]
+    I --> I1["S1: Décideur identifié (0-4)"]
+    I --> I2["S2: Budget validé (0-4)"]
+    I --> I3["S3: Urgence/planning (0-4)"]
+    I --> I4["S4: Champion qualifié (0-4)"]
+    I --> I5["S5: Pain aligné (0-4)"]
+    I --> I6["S6: Effet waouh démo (0-4)"]
+    I --> I7["S7: Relation décideur (0-4)"]
+    I --> I8["S8: Qualité relances (0-4)"]
+
+    I1 & I2 & I3 & I4 & I5 & I6 & I7 & I8 --> J[Promise.all — Red flags]
+    J --> J1["RF1: Deal zombie >45j<br/>déterministe — malus -3"]
+    J --> J2["RF2: Date repoussée ≥2x<br/>déterministe — malus -3"]
+    J --> J3["RF3: Aucun C-Level<br/>LLM — malus -2"]
+    J --> J4["RF4: Interlocuteur non décisionnel<br/>LLM — malus -3"]
+    J --> J5["RF5: Concurrent non traité<br/>LLM — malus -1"]
+    J --> J6["RF6: Discount sans contrepartie<br/>LLM — malus -2"]
+
+    J1 & J2 & J3 & J4 & J5 & J6 --> K[Agrégation<br/>score_brut = Σ signaux<br/>score_ajusté = brut - malus<br/>pct = ajusté/32 × 100<br/>zone = ROUGE ≤10 / ORANGE ≤21 / VERT]
+
+    K --> L[Promise.all — Écriture]
+    L --> L1[Supabase: INSERT deal_scoring<br/>audit complet + prompts + input raw]
+    L --> L2[HubSpot: PATCH deal<br/>13 propriétés ai_*]
+    L --> L3[HubSpot: POST note timeline<br/>résumé scoring formaté]
+
+    L1 & L2 & L3 --> D
+
+    D -->|Tous traités| M[Recap Slack]
+    M --> M1{{script_logs: résultats + erreurs}}
+```
+
 ## Important Rules
 
 - **Edge Function `/functions/v1/enrich`**: This is the enrichment function hosted on Supabase. **Never reinvent or replace it.** Always call it as-is with `{ parameter: "all", contact_linkedin_url: "http://linkedin.com/in/{id}" }`.
@@ -955,6 +1009,24 @@ flowchart TD
 - `image_mapping`: jsonb, `[IMAGE_N]` → original URL mapping
 - `status`: `pending` or `done`
 
+### `deal_scoring`
+- **Supabase project**: `rcpcdpxqjxeikbssprdz` (ai_ae_sdr_agent) — via `AI_AE_SDR_SUPABASE_URL`/`AI_AE_SDR_SUPABASE_KEY`
+- Résultats du scoring AI des deals (from `score-deal-forecast`)
+- PK: `id` (bigserial)
+- `deal_hubspot_id`: HubSpot deal ID, `deal_name`, `deal_stage`, `deal_owner_name`
+- 8 scores individuels: `decision_maker_access`, `budget_validation`, `urgency_timeline`, `champion_strength`, `pain_fit`, `demo_impact`, `exec_relationship_depth`, `outreach_quality` (SMALLINT 0-4)
+- Agrégés: `forecast_score_raw` (brut /32), `forecast_score` (ajusté), `forecast_closing_pct` (0-100%), `forecast_zone` (ROUGE/ORANGE/VERT)
+- Red flags: `rf_deal_zombie`, `rf_close_date_pushed`, `rf_no_clevel_post_demo`, `rf_non_decision_maker`, `rf_competitor_unaddressed`, `rf_discount_no_tradeoff` (boolean), `total_malus`
+- Audit: `signals_detail` (JSONB), `red_flags_detail` (JSONB), `input_activities_count`, `input_activities_raw` (JSONB), `prompts_used` (JSONB), `model_used`
+- Metadata: `triggered_by` (slack/claude_code/manual), `trigger_payload` (JSONB)
+- Historique cumulatif : chaque run = 1 INSERT par deal, on peut tracer l'évolution dans le temps
+
+### `PRC_DEAL_ACTIVITIES`
+- **Supabase project**: `rcpcdpxqjxeikbssprdz` (ai_ae_sdr_agent) — read via `AI_AE_SDR_SUPABASE_URL`/`AI_AE_SDR_SUPABASE_KEY`
+- Deal activities synced via Airbyte, read-only
+- Fields: `DEAL_HUBSPOT_ID`, `DEAL_NAME`, `DEAL_STAGE`, `DEAL_OWNER_NAME`, `ACTIVITY_TYPE`, `ACTIVITY_DIRECTION`, `ACTIVITY_METADATA` (JSON), `CONTACTS` (JSON), `SENDER` (JSON), `ACTIVITY_RECORDED_ON`
+- Used by `score-deal-forecast`
+
 ## External APIs (non-Unipile)
 
 - **LGM (LaGrowthMachine)**: `POST https://apiv2.lagrowthmachine.com/flow/leads?apikey=X` — send leads with audience name. Env var: `LGM_API_KEY`
@@ -969,6 +1041,8 @@ flowchart TD
 - **LangGraph**: `POST {LANGGRAPH_BASE_URL}/runs` — async agent run with `{ assistant_id: "full_pipeline", input: { contact_data: payload } }`. Auth: `x-api-key` header. Env vars: `LANGGRAPH_BASE_URL` (prod/staging URLs differ), `LANGGRAPH_API_KEY`
 - **Crisp**: `GET/POST https://api.crisp.chat/v1/website/{websiteId}/...` — conversations, messages, metas. Auth: HTTP Basic (`CRISP_IDENTIFIER:CRISP_KEY`), header `X-Crisp-Tier: plugin`. Rate limit: 500 req/24h. Env vars: `CRISP_IDENTIFIER`, `CRISP_KEY`, `CRISP_WEBSITE_ID`
 - **Circle**: `GET https://{CIRCLE_COMMUNITY_HOST}/api/admin/v2/...` — spaces, posts, comments. Auth: `Authorization: Token {CIRCLE_API_TOKEN}`. Rate limit: 300 req/min. Env vars: `CIRCLE_API_TOKEN`, `CIRCLE_COMMUNITY_HOST`
+- **HubSpot Properties API**: `POST/GET https://api.hubapi.com/crm/v3/properties/deals` — auto-création du property group `ai_forecast_scoring` et des 13 propriétés `ai_*`. Idempotent (409 Conflict ignoré). Used by `score-deal-forecast`
+- **HubSpot Notes API**: `POST https://api.hubapi.com/crm/v3/objects/notes` — note timeline avec résumé scoring. Association via `PUT /crm/v4/objects/notes/{noteId}/associations/deals/{dealId}`. Used by `score-deal-forecast`
 
 ## Unipile API
 
