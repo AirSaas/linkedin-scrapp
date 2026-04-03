@@ -221,6 +221,9 @@ export const scoreDealForecastTask = task({
           createScoringNote(dealId, scoring),
         ]);
 
+        // 2h. Reset score_now to empty (so Zapier doesn't re-trigger)
+        await resetScoreNow(dealId);
+
         results.push(scoring);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -851,6 +854,20 @@ async function sendSlackRecap(
 // ============================================
 // HELPERS
 // ============================================
+
+async function resetScoreNow(dealId: string): Promise<void> {
+  try {
+    await callHubSpot(
+      `https://api.hubapi.com/crm/v3/objects/deals/${dealId}`,
+      "PATCH",
+      { properties: { score_now: "" } }
+    );
+    logger.info(`Reset score_now for deal ${dealId}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`Failed to reset score_now for deal ${dealId}: ${msg}`);
+  }
+}
 
 function safeParseJSON(str: string): unknown {
   try {
