@@ -167,7 +167,8 @@ async function fetchDecisions(startISO: string, endISO: string): Promise<FinalDe
     .from("final_decision")
     .select("id, created_at, status, owner_name, canal_used, rating, cancelled_reason")
     .gte("created_at", startISO)
-    .lt("created_at", endISO);
+    .lt("created_at", endISO)
+    .neq("owner_name", "simon_vacher");
 
   if (error) throw new Error(`Failed to fetch final_decision: ${error.message}`);
   return (data ?? []) as FinalDecisionRow[];
