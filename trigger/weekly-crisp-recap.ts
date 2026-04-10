@@ -714,9 +714,9 @@ async function sendSlackRecap(
 }
 
 async function postToWebhook(text: string): Promise<void> {
-  const webhookUrl = process.env.webhook_crisp_recap;
+  const webhookUrl = process.env.script_logs;
   if (!webhookUrl) {
-    logger.error("webhook_crisp_recap not configured");
+    logger.error("script_logs webhook not configured");
     return;
   }
 
