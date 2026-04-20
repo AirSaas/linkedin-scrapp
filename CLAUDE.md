@@ -46,6 +46,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/import-circle-posts.ts` — weekly sync of Circle posts + comments from `ca-vient-de-sortir` space → Supabase `circle_posts` (tchat-support-sync project), incremental via `circle_sync_cursor`
 - `trigger/generate-faq-document.ts` — manual task: reads `tchat_faq_extractions` (score >= 3), consolidates themes + deduplicates via Claude Opus in batches, generates structured Markdown FAQ document, saves to `tchat_faq_documents`
 - `trigger/audit-circle-documentation.ts` — manual task: cross-references FAQ extractions with Circle articles, produces audit report with article rewrites (image-preserving), new article drafts, and orphan detection. Resume support via `tchat_doc_audit_items`. Saves to `tchat_faq_documents` with type `doc_audit`
+- `trigger/audit-circle-vs-faq.ts` — manual task: parts de la FAQ de référence approuvée (type=`faq_approved`), pré-mappe chaque article Circle publié (3 espaces) sur les thèmes FAQ via scoring lexical, puis pour chaque article couvert génère un résumé des modifs + version actuelle + version proposée (images [IMAGE_N] préservées), et pour chaque thème FAQ sans article Circle génère un nouveau brouillon. Rapport Markdown sauvegardé dans `tchat_faq_documents` avec type `circle_vs_faq_audit`. Support `{ dryRun: true }` pour inspecter le pré-mapping
 - `trigger/propose-faq-updates.ts` — manual monthly task: compares recent Crisp extractions + Circle articles against approved FAQ reference, produces HTML proposal with new questions, answer updates (before/after diff), removals, and Circle article suggestions. 2-pass Opus architecture. Saves to `tchat_faq_documents` with type `faq_proposal`
 - `trigger/weekly-crisp-recap.ts` — weekly Friday 8h30 recap of Crisp support conversations (vendredi→vendredi). AI classification (type, subject, waiting_on, close_suggestion), global themes analysis, avg response time, operator stats. Posts to `webhook_crisp_recap`
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
@@ -53,7 +54,10 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/lib/crisp.ts` — Crisp REST API client (Basic auth, rate limit 500/24h, lazy-init)
 - `trigger/lib/crisp-supabase.ts` — Supabase client for tchat-support-sync project `oqiowupiczgrezgyopfm` (lazy-init, dedicated env vars)
 - `trigger/lib/circle-supabase.ts` — Supabase helpers for Circle posts sync (upsert posts, sync cursor) on tchat-support-sync project
+- `trigger/lib/faq-parser.ts` — shared parser for approved FAQ markdown (TOC, themes, sections by title/theme). Used by `propose-faq-updates.ts` and `audit-circle-vs-faq.ts`
+- `trigger/lib/circle-audit-helpers.ts` — shared helpers for Circle article audits: `htmlToMarkdownWithImages` ([IMAGE_N] placeholders), `formatComments`, `callOpus` (retry-once). Used by `audit-circle-documentation.ts` and `audit-circle-vs-faq.ts`
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
+- `scripts/upload-faq-approved.ts` — one-shot script: uploads (or updates) a canonical FAQ markdown to Supabase `tchat_faq_documents` with `type=faq_approved`. Must be run locally before `audit-circle-vs-faq` or `propose-faq-updates`. Usage: `TCHAT_SUPPORT_SYNC_SUPABASE_URL=... TCHAT_SUPPORT_SYNC_SUPABASE_SERVICE_KEY=... npx tsx scripts/upload-faq-approved.ts docs/faq-approved-YYYY-MM-DD.md`
 - `trigger/score-deal-forecast.ts` — pipeline de scoring AI des deals HubSpot : 8 signaux (0-4) + 6 red flags → score /32, zone ROUGE/ORANGE/VERT. Pousse vers HubSpot (13 propriétés ai_* + note timeline) et Supabase (deal_scoring). Prompts dans `trigger/prompts/deal-scoring/`
 - `trigger/prompts/deal-scoring/` — 12 prompts Markdown (8 signaux + 4 red flags) + contexte AirSaaS, lisibles directement sur GitHub
 - `trigger/lib/deal-scoring-prompts.ts` — prompts en template literals + types + configs signaux/red flags. Source of truth `.md`, miroir `.ts` pour le bundler esbuild
@@ -122,6 +126,8 @@ flowchart LR
     ACD --> SB_CR & SL
     SB_CR --> PFU[propose-faq-updates]
     PFU --> SB_CR & SL
+    SB_CR --> ACF[audit-circle-vs-faq]
+    ACF --> SB_CR & SL
     SB_CR --> WCR[weekly-crisp-recap]
     WCR --> SL
     WUR --> SL
@@ -663,6 +669,38 @@ flowchart TD
     Q --> R{{Slack: script_logs}}
 ```
 
+### `audit-circle-vs-faq` (manual)
+
+```mermaid
+flowchart TD
+    A([Manuel]) --> B[Fetch FAQ<br/>tchat_faq_documents type=faq_approved]
+    B --> C{FAQ trouvée ?}
+    C -->|Non| D[Erreur: upload FAQ d'abord<br/>scripts/upload-faq-approved.ts]
+    C -->|Oui| E[parseFaq : TOC + thèmes + index]
+
+    E --> F[Fetch circle_posts<br/>status = published]
+    F --> G[Pré-mapping lexical<br/>normalizeTokens + overlap<br/>top 3 thèmes / article]
+
+    G --> H{Mode ?}
+    H -->|dryRun| I[Retour mapping sample]
+    H -->|Full run| J[Partition articles :<br/>covered / skipped<br/>+ thèmes uncovered]
+
+    J --> K{Partie A : articles couverts}
+    K --> L[Opus : audit contre FAQ<br/>JSON summary_changes + rewritten_md<br/>images [IMAGE_N] préservées]
+    L --> M[Insert tchat_doc_audit_items<br/>audit_type = update_needed / no_change]
+
+    J --> N{Partie B : thèmes sans article}
+    N --> O[Opus : brouillon nouvel article<br/>JSON title + space + article_md]
+    O --> P[Insert tchat_doc_audit_items<br/>audit_type = new_article]
+
+    M & P --> Q[buildReportMarkdown<br/>sections 1→4]
+    Q --> R[Insert tchat_faq_documents<br/>type = circle_vs_faq_audit]
+    R --> S{{Slack: script_logs}}
+
+    L -->|Fail| T{{sendErrorToScriptLogs}}
+    O -->|Fail| T
+```
+
 ### `weekly-crisp-recap` (weekly Friday 8h30)
 
 ```mermaid
@@ -995,7 +1033,7 @@ flowchart TD
 - `markdown`: full Markdown document text
 - `stats`: jsonb `{ total_entries_before, total_entries_after, total_themes, min_score }`
 - `metadata`: jsonb `{ batch_count, generation_duration_ms }`
-- `type`: text (`faq` default, `doc_audit` for audit reports) — versions are per type
+- `type`: text — versions are per type. Known values: `faq` (default, generated FAQ), `faq_approved` (canonical reference uploaded via `scripts/upload-faq-approved.ts`), `faq_proposal` (output of `propose-faq-updates`), `doc_audit` (output of `audit-circle-documentation`), `circle_vs_faq_audit` (output of `audit-circle-vs-faq`)
 
 ### `tchat_doc_audit_items`
 - **Supabase project**: `oqiowupiczgrezgyopfm` (tchat-support-sync)
@@ -1004,7 +1042,7 @@ flowchart TD
 - `audit_run_id`: text, groups items by run
 - `article_url`: article URL (null for new article drafts)
 - `article_name`: article title
-- `audit_type`: `update`, `create`, or `orphan`
+- `audit_type`: `update`, `create`, `orphan` (from `audit-circle-documentation`), OR `update_needed`, `no_change`, `new_article` (from `audit-circle-vs-faq`)
 - `analysis`: full Opus analysis text (diagnostic + rewrite)
 - `image_mapping`: jsonb, `[IMAGE_N]` → original URL mapping
 - `status`: `pending` or `done`

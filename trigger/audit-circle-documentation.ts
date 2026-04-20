@@ -11,6 +11,7 @@ import {
   type FaqEntry,
   type CirclePostForAudit,
 } from "./lib/crisp-supabase.js";
+import { htmlToMarkdownWithImages, formatComments, callOpus } from "./lib/circle-audit-helpers.js";
 
 // ============================================
 // CONFIGURATION
@@ -219,7 +220,7 @@ ${commentsText ? `### Commentaires sur l'article (${post.comments_count})\n${com
 ### Questions Crisp qui référencent cet article (${entries.length})
 ${faqText}`;
 
-        const analysis = await callOpus(client, ARTICLE_AUDIT_SYSTEM, userPrompt, MAX_TOKENS_PER_ARTICLE);
+        const analysis = await callOpus(client, OPUS_MODEL, ARTICLE_AUDIT_SYSTEM, userPrompt, MAX_TOKENS_PER_ARTICLE, TEMPERATURE);
 
         if (analysis) {
           await insertAuditItem({
@@ -273,7 +274,7 @@ ${faqText}`;
 
 ${faqText}`;
 
-        const analysis = await callOpus(client, NEW_ARTICLE_SYSTEM, userPrompt, MAX_TOKENS_NEW_ARTICLE);
+        const analysis = await callOpus(client, OPUS_MODEL, NEW_ARTICLE_SYSTEM, userPrompt, MAX_TOKENS_NEW_ARTICLE, TEMPERATURE);
 
         if (analysis) {
           await insertAuditItem({
@@ -429,128 +430,6 @@ ${faqText}`;
     }
   },
 });
-
-// ============================================
-// HELPERS
-// ============================================
-
-function htmlToMarkdownWithImages(html: string): { markdown: string; imageMapping: Record<string, string> } {
-  const imageMapping: Record<string, string> = {};
-  let imageCounter = 0;
-
-  // Replace <img> tags with placeholders
-  let md = html.replace(/<img[^>]+src="([^"]+)"[^>]*>/gi, (_match, src) => {
-    imageCounter++;
-    const key = `[IMAGE_${imageCounter}]`;
-    imageMapping[key] = src;
-    return `\n\n${key}\n\n`;
-  });
-
-  // Basic HTML → markdown conversion
-  md = md
-    .replace(/<h1[^>]*>(.*?)<\/h1>/gi, "# $1\n")
-    .replace(/<h2[^>]*>(.*?)<\/h2>/gi, "## $1\n")
-    .replace(/<h3[^>]*>(.*?)<\/h3>/gi, "### $1\n")
-    .replace(/<h4[^>]*>(.*?)<\/h4>/gi, "#### $1\n")
-    .replace(/<strong>(.*?)<\/strong>/gi, "**$1**")
-    .replace(/<b>(.*?)<\/b>/gi, "**$1**")
-    .replace(/<em>(.*?)<\/em>/gi, "*$1*")
-    .replace(/<i>(.*?)<\/i>/gi, "*$1*")
-    .replace(/<a[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>/gi, "[$2]($1)")
-    .replace(/<li[^>]*>(.*?)<\/li>/gi, "- $1\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<p[^>]*>(.*?)<\/p>/gis, "$1\n\n")
-    .replace(/<\/?(ul|ol|div|span|section|article|figure|figcaption|blockquote)[^>]*>/gi, "\n")
-    .replace(/<[^>]+>/g, "") // Remove remaining tags
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/\n{3,}/g, "\n\n") // Collapse multiple newlines
-    .trim();
-
-  return { markdown: md, imageMapping };
-}
-
-function formatComments(comments: unknown[] | null): string {
-  if (!comments || !Array.isArray(comments) || comments.length === 0) return "";
-
-  const lines: string[] = [];
-
-  for (const c of comments as Record<string, unknown>[]) {
-    const user = c.user as Record<string, string> | undefined;
-    const body = c.body as Record<string, string> | undefined;
-    if (!user?.name || !body?.body) continue;
-
-    const text = body.body
-      .replace(/<[^>]+>/g, "")
-      .replace(/&nbsp;/g, " ")
-      .replace(/\n{2,}/g, "\n")
-      .trim();
-
-    if (text) {
-      lines.push(`**${user.name}** : ${text}`);
-    }
-
-    // Include replies
-    if (Array.isArray(c.replies)) {
-      for (const r of c.replies as Record<string, unknown>[]) {
-        const rUser = r.user as Record<string, string> | undefined;
-        const rBody = r.body as Record<string, string> | undefined;
-        if (!rUser?.name || !rBody?.body) continue;
-
-        const rText = rBody.body
-          .replace(/<[^>]+>/g, "")
-          .replace(/&nbsp;/g, " ")
-          .replace(/\n{2,}/g, "\n")
-          .trim();
-
-        if (rText) {
-          lines.push(`  ↳ **${rUser.name}** : ${rText}`);
-        }
-      }
-    }
-  }
-
-  return lines.join("\n\n");
-}
-
-async function callOpus(
-  client: Anthropic,
-  systemPrompt: string,
-  userPrompt: string,
-  maxTokens: number
-): Promise<string | null> {
-  const callOnce = async () => {
-    const stream = client.messages.stream({
-      model: OPUS_MODEL,
-      max_tokens: maxTokens,
-      temperature: TEMPERATURE,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userPrompt }],
-    });
-
-    const message = await stream.finalMessage();
-    const textBlock = message.content.find((b) => b.type === "text");
-    if (!textBlock || textBlock.type !== "text") return null;
-    return textBlock.text.trim();
-  };
-
-  try {
-    return await callOnce();
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.warn(`Opus call failed, retrying in 5s: ${msg}`);
-    await new Promise((r) => setTimeout(r, 5000));
-    try {
-      return await callOnce();
-    } catch (retryErr) {
-      logger.error(`Opus call failed after retry: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
-      return null;
-    }
-  }
-}
 
 async function sendSuccessSlack(
   version: number,
