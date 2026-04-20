@@ -9,6 +9,7 @@ import {
   type FaqEntry,
   type CirclePostForAudit,
 } from "./lib/crisp-supabase.js";
+import { parseFaq } from "./lib/faq-parser.js";
 
 // ============================================
 // CONFIGURATION
@@ -318,61 +319,6 @@ export const proposeFaqUpdates = task({
     };
   },
 });
-
-// ============================================
-// FAQ PARSER
-// ============================================
-
-function parseFaq(markdown: string): { toc: string[]; sectionsByTitle: Record<string, string> } {
-  const lines = markdown.split("\n");
-  const toc: string[] = [];
-  const sectionsByTitle: Record<string, string> = {};
-
-  let currentTitle = "";
-  let currentContent: string[] = [];
-  let currentTheme = "";
-
-  for (const line of lines) {
-    // Theme header (## level)
-    const themeMatch = line.match(/^## (.+)/);
-    if (themeMatch) {
-      // Save previous section
-      if (currentTitle) {
-        sectionsByTitle[currentTitle] = currentContent.join("\n");
-      }
-      currentTheme = themeMatch[1].trim();
-      toc.push(`## ${currentTheme}`);
-      currentTitle = "";
-      currentContent = [];
-      continue;
-    }
-
-    // Question header (### level)
-    const questionMatch = line.match(/^### (.+)/);
-    if (questionMatch) {
-      // Save previous section
-      if (currentTitle) {
-        sectionsByTitle[currentTitle] = currentContent.join("\n");
-      }
-      currentTitle = questionMatch[1].trim();
-      toc.push(`  - ${currentTitle}`);
-      currentContent = [line];
-      continue;
-    }
-
-    // Accumulate content for current section
-    if (currentTitle) {
-      currentContent.push(line);
-    }
-  }
-
-  // Save last section
-  if (currentTitle) {
-    sectionsByTitle[currentTitle] = currentContent.join("\n");
-  }
-
-  return { toc, sectionsByTitle };
-}
 
 // ============================================
 // TRIAGE CALL (Pass 1)
