@@ -187,14 +187,17 @@ interface NewArticleOutput {
 
 export const auditCircleVsFaq = task({
   id: "audit-circle-vs-faq",
-  maxDuration: 7200, // 2h
-  run: async (payload?: { dryRun?: boolean }) => {
+  maxDuration: 14400, // 4h — 3 Opus passes per article, 160 articles = ~3h
+  run: async (payload?: { dryRun?: boolean; resumeRunId?: string }) => {
     const startTime = Date.now();
     const dryRun = payload?.dryRun ?? false;
-    const auditRunId = crypto.randomUUID();
+    const auditRunId = payload?.resumeRunId ?? crypto.randomUUID();
+    const resuming = Boolean(payload?.resumeRunId);
     const errors: TaskResultGroup[] = [];
 
-    logger.info(`=== START audit-circle-vs-faq (runId=${auditRunId}, dryRun=${dryRun}) ===`);
+    logger.info(
+      `=== START audit-circle-vs-faq (runId=${auditRunId}, dryRun=${dryRun}, resuming=${resuming}) ===`
+    );
 
     try {
       // ──────────────────────────────────────────
@@ -256,19 +259,36 @@ export const auditCircleVsFaq = task({
 
       const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+      // Resume: build set of URLs already done for this run_id
+      const alreadyDone = new Set<string>();
+      if (resuming) {
+        const existing = await getAuditItemsByRunId(auditRunId);
+        for (const item of existing) {
+          if (item.article_url) alreadyDone.add(item.article_url);
+        }
+        logger.info(`Resume: ${alreadyDone.size} items already done for runId=${auditRunId}`);
+      }
+
       // ──────────────────────────────────────────
       // 3. Partie A — audit covered articles (filter → rewrite → review)
       // ──────────────────────────────────────────
       let auditedCount = 0;
+      let skippedResumeCount = 0;
       let noChangeCount = 0;
       let offTopicCount = 0;
       let regeneratedCount = 0;
 
       for (let i = 0; i < coveredArticles.length; i++) {
         const { post, themes } = coveredArticles[i];
+
+        if (alreadyDone.has(post.url)) {
+          skippedResumeCount++;
+          continue;
+        }
+
         auditedCount++;
         logger.info(
-          `[Partie A ${auditedCount}/${coveredArticles.length}] "${post.name}" (themes: ${themes.join(", ")})`
+          `[Partie A ${auditedCount}/${coveredArticles.length - skippedResumeCount}] "${post.name}" (themes: ${themes.join(", ")})`
         );
 
         const { markdown: articleMd, imageMapping } = htmlToMarkdownWithImages(post.body_html);
@@ -443,7 +463,7 @@ Instructions précises : ${reviewResult.regeneration_hint}`;
       }
 
       logger.info(
-        `Partie A done: ${auditedCount} audited (${noChangeCount} no-change, ${offTopicCount} off-topic, ${regeneratedCount} regenerated)`
+        `Partie A done: ${auditedCount} audited, ${skippedResumeCount} resumed (${noChangeCount} no-change, ${offTopicCount} off-topic, ${regeneratedCount} regenerated)`
       );
 
       // ──────────────────────────────────────────
@@ -454,6 +474,12 @@ Instructions précises : ${reviewResult.regeneration_hint}`;
       for (const theme of uncoveredThemes) {
         const questions = faq.sectionsByTheme[theme] || [];
         if (questions.length === 0) continue;
+
+        const themeKey = `new_article:${theme}`;
+        if (alreadyDone.has(themeKey)) {
+          skippedResumeCount++;
+          continue;
+        }
 
         newArticleCount++;
         logger.info(
@@ -562,6 +588,7 @@ ${themeContent}`;
       const docMeta = {
         audit_run_id: auditRunId,
         generation_duration_ms: Date.now() - startTime,
+        resumed_items: skippedResumeCount,
       };
 
       const version = await insertFaqDocumentWithType(
