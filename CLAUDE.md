@@ -46,7 +46,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/import-circle-posts.ts` — weekly sync of Circle posts + comments from `ca-vient-de-sortir` space → Supabase `circle_posts` (tchat-support-sync project), incremental via `circle_sync_cursor`
 - `trigger/generate-faq-document.ts` — manual task: reads `tchat_faq_extractions` (score >= 3), consolidates themes + deduplicates via Claude Opus in batches, generates structured Markdown FAQ document, saves to `tchat_faq_documents`
 - `trigger/audit-circle-documentation.ts` — manual task: cross-references FAQ extractions with Circle articles, produces audit report with article rewrites (image-preserving), new article drafts, and orphan detection. Resume support via `tchat_doc_audit_items`. Saves to `tchat_faq_documents` with type `doc_audit`
-- `trigger/audit-circle-vs-faq.ts` — manual task: parts de la FAQ de référence approuvée (type=`faq_approved`), pré-mappe chaque article Circle publié (3 espaces) sur les thèmes FAQ via scoring lexical, puis pour chaque article couvert génère un résumé des modifs + version actuelle + version proposée (images [IMAGE_N] préservées), et pour chaque thème FAQ sans article Circle génère un nouveau brouillon. Rapport Markdown sauvegardé dans `tchat_faq_documents` avec type `circle_vs_faq_audit`. Support `{ dryRun: true }` pour inspecter le pré-mapping
+- `trigger/audit-circle-vs-faq.ts` — manual task: part de la FAQ de référence approuvée (type=`faq_approved`), pré-mappe chaque article Circle publié (3 espaces) sur les thèmes FAQ via scoring lexical, puis pipeline 3-passes par article couvert : (1) filtre amont Opus (reject off_topic si mapping lexical invalidé sémantiquement), (2) réécriture Opus (résumé modifs + version proposée, images [IMAGE_N] préservées), (3) revue critique Opus (verdict keep/regenerate/skip + 1 régénération si dérive corrigible). Pour chaque thème FAQ sans article Circle, brouillon nouvel article Opus. Rapport Markdown sauvegardé dans `tchat_faq_documents` avec type `circle_vs_faq_audit`. Support `{ dryRun: true }` pour inspecter le pré-mapping. **Post-traitement DOCX** : `python3 scripts/audit-to-docx.py <run_id> <in.md> <out.docx>` produit un DOCX avec diff visuel natif Word (surlignage + barré via python-docx)
 - `trigger/propose-faq-updates.ts` — manual monthly task: compares recent Crisp extractions + Circle articles against approved FAQ reference, produces HTML proposal with new questions, answer updates (before/after diff), removals, and Circle article suggestions. 2-pass Opus architecture. Saves to `tchat_faq_documents` with type `faq_proposal`
 - `trigger/weekly-crisp-recap.ts` — weekly Friday 8h30 recap of Crisp support conversations (vendredi→vendredi). AI classification (type, subject, waiting_on, close_suggestion), global themes analysis, avg response time, operator stats. Posts to `webhook_crisp_recap`
 - `trigger/lib/unipile.ts` — Unipile API client (rawRoute, getUser, search, getRelations, getChats, getChatMessages, getChatAttendees, getEmails)
@@ -58,6 +58,7 @@ Base URL: `https://api.trigger.dev`, auth via `Authorization: Bearer <secret_key
 - `trigger/lib/circle-audit-helpers.ts` — shared helpers for Circle article audits: `htmlToMarkdownWithImages` ([IMAGE_N] placeholders), `formatComments`, `callOpus` (retry-once). Used by `audit-circle-documentation.ts` and `audit-circle-vs-faq.ts`
 - `trigger/lib/utils.ts` — shared helpers (sleep, parseViewedAgoText, etc.)
 - `scripts/upload-faq-approved.ts` — one-shot script: uploads (or updates) a canonical FAQ markdown to Supabase `tchat_faq_documents` with `type=faq_approved`. Must be run locally before `audit-circle-vs-faq` or `propose-faq-updates`. Usage: `TCHAT_SUPPORT_SYNC_SUPABASE_URL=... TCHAT_SUPPORT_SYNC_SUPABASE_SERVICE_KEY=... npx tsx scripts/upload-faq-approved.ts docs/faq-approved-YYYY-MM-DD.md`
+- `scripts/audit-to-docx.py` — post-traitement DOCX pour `audit-circle-vs-faq` : lit le rapport MD + les items `tchat_doc_audit_items` via Supabase REST, calcule un diff word-level natif Word (normalisation typographique + `difflib.SequenceMatcher`) pour chaque article de la section "Articles à mettre à jour", rend le tout via python-docx avec `w:highlight`/`w:strike` natifs (pas de HTML inline, pas de pandoc). Usage : `TCHAT_SUPPORT_SYNC_SUPABASE_URL=... TCHAT_SUPPORT_SYNC_SUPABASE_SERVICE_KEY=... python3 scripts/audit-to-docx.py <audit_run_id> <input.md> <output.docx>`
 - `trigger/score-deal-forecast.ts` — pipeline de scoring AI des deals HubSpot : 8 signaux (0-4) + 6 red flags → score /32, zone ROUGE/ORANGE/VERT. Pousse vers HubSpot (13 propriétés ai_* + note timeline) et Supabase (deal_scoring). Prompts dans `trigger/prompts/deal-scoring/`
 - `trigger/prompts/deal-scoring/` — 12 prompts Markdown (8 signaux + 4 red flags) + contexte AirSaaS, lisibles directement sur GitHub
 - `trigger/lib/deal-scoring-prompts.ts` — prompts en template literals + types + configs signaux/red flags. Source of truth `.md`, miroir `.ts` pour le bundler esbuild
@@ -686,16 +687,27 @@ flowchart TD
     H -->|Full run| J[Partition articles :<br/>covered / skipped<br/>+ thèmes uncovered]
 
     J --> K{Partie A : articles couverts}
-    K --> L[Opus : audit contre FAQ<br/>JSON summary_changes + rewritten_md<br/>images [IMAGE_N] préservées]
-    L --> M[Insert tchat_doc_audit_items<br/>audit_type = update_needed / no_change]
+    K --> K1[Passe 1 — Filtre amont<br/>Opus MAPPING_FILTER_SYSTEM<br/>verdict relevant/off_topic]
+    K1 -->|off_topic| K2[Insert audit_items<br/>audit_type = off_topic<br/>rejected_at = filter]
+    K1 -->|relevant| L[Passe 2 — Réécriture<br/>Opus ARTICLE_AUDIT_SYSTEM<br/>JSON summary_changes + rewritten_md<br/>images [IMAGE_N] préservées]
+    L --> L1{summary_changes vide ?}
+    L1 -->|Oui| L2[Insert audit_items<br/>audit_type = no_change]
+    L1 -->|Non| L3[Passe 3 — Revue critique<br/>Opus REVIEW_SYSTEM<br/>verdict keep/regenerate/skip]
+    L3 -->|regenerate| L4[1 régénération<br/>avec regeneration_hint]
+    L4 --> L5{Revue finale}
+    L5 -->|keep| M[Insert audit_items<br/>audit_type = update_needed]
+    L5 -->|skip/regenerate| K2
+    L3 -->|keep| M
+    L3 -->|skip| K2
 
     J --> N{Partie B : thèmes sans article}
     N --> O[Opus : brouillon nouvel article<br/>JSON title + space + article_md]
     O --> P[Insert tchat_doc_audit_items<br/>audit_type = new_article]
 
-    M & P --> Q[buildReportMarkdown<br/>sections 1→4]
+    K2 & L2 & M & P --> Q[buildReportMarkdown<br/>sections 1→5]
     Q --> R[Insert tchat_faq_documents<br/>type = circle_vs_faq_audit]
     R --> S{{Slack: script_logs}}
+    R --> Z[Post-traitement local<br/>scripts/audit-to-docx.py<br/>→ DOCX avec diff natif Word]
 
     L -->|Fail| T{{sendErrorToScriptLogs}}
     O -->|Fail| T
@@ -1042,7 +1054,7 @@ flowchart TD
 - `audit_run_id`: text, groups items by run
 - `article_url`: article URL (null for new article drafts)
 - `article_name`: article title
-- `audit_type`: `update`, `create`, `orphan` (from `audit-circle-documentation`), OR `update_needed`, `no_change`, `new_article` (from `audit-circle-vs-faq`)
+- `audit_type`: `update`, `create`, `orphan` (from `audit-circle-documentation`), OR `update_needed`, `no_change`, `off_topic`, `new_article` (from `audit-circle-vs-faq`). `off_topic` = article rejeté par le filtre amont ou par la revue critique (mapping lexical invalidé sémantiquement / dérive détectée)
 - `analysis`: full Opus analysis text (diagnostic + rewrite)
 - `image_mapping`: jsonb, `[IMAGE_N]` → original URL mapping
 - `status`: `pending` or `done`

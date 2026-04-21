@@ -669,8 +669,10 @@ async function sendSlackRecap(
     }
   }
 
-  // Waiting on support
-  const waitingSupport = classified.filter((c) => c.waiting_on === "support");
+  // Waiting on support (exclude conversations flagged as "à fermer" — no real work left)
+  const waitingSupport = classified.filter(
+    (c) => c.waiting_on === "support" && !c.close_suggestion?.startsWith("oui")
+  );
   if (waitingSupport.length > 0) {
     text += `\n⏳ *En attente de notre réponse (${waitingSupport.length})*\n`;
     for (const c of waitingSupport) {

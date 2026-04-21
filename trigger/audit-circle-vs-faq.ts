@@ -23,6 +23,8 @@ import {
 const OPUS_MODEL = "claude-opus-4-20250514";
 const MAX_TOKENS_PER_ARTICLE = 16000;
 const MAX_TOKENS_NEW_ARTICLE = 10000;
+const MAX_TOKENS_FILTER = 800;
+const MAX_TOKENS_REVIEW = 1500;
 const TEMPERATURE = 0.3;
 const TOP_THEMES_PER_ARTICLE = 3;
 const MIN_THEME_SCORE = 1;
@@ -68,6 +70,61 @@ Si après analyse l'article est parfaitement aligné avec la FAQ et qu'aucune mo
   "rewritten_article_md": ""
 }`;
 
+const MAPPING_FILTER_SYSTEM = `Tu es un expert en documentation produit pour AirSaas / PRC (SaaS B2B de gestion de projets).
+
+Tu reçois :
+1. Un article Circle (titre + début du contenu)
+2. Les thèmes FAQ qui lui ont été associés par un mapping lexical (mots-clés communs)
+
+Le mapping lexical peut produire de faux positifs (ex: article de test, blague, sujet hors-produit qui partage juste quelques mots).
+
+Ta mission : dire si le sujet RÉEL de l'article est sémantiquement couvert par au moins un de ces thèmes FAQ.
+
+Critères :
+- "relevant" : l'article traite vraiment d'un sujet qui correspond à au moins un thème (même partiellement)
+- "off_topic" : l'article traite d'un sujet étranger aux thèmes (test, blague, sujet hors-produit, contenu poubelle)
+
+FORMAT JSON strict, pas de prose, pas de backticks :
+{
+  "verdict": "relevant" | "off_topic",
+  "reason": "Phrase courte expliquant la décision",
+  "best_theme": "Le thème le plus pertinent parmi ceux proposés, ou null si off_topic"
+}`;
+
+const REVIEW_SYSTEM = `Tu es un relecteur CRITIQUE et exigeant en documentation produit pour AirSaas / PRC.
+
+Tu reçois :
+1. Un article Circle ORIGINAL (avant modification)
+2. Une RÉÉCRITURE proposée, censée corriger l'article selon la FAQ de référence
+3. Les thèmes FAQ ciblés
+
+Ta mission : juger sévèrement la qualité de la réécriture. Cherche activement les problèmes.
+
+Critères éliminatoires (→ "regenerate" ou "skip") :
+- La réécriture parle d'un SUJET DIFFÉRENT de l'original (drift, hallucination)
+- La réécriture affirme des choses NI dans la FAQ NI dans l'original (invention)
+- La réécriture perd des informations importantes de l'original sans raison
+- La réécriture mentionne des fonctionnalités ou concepts étrangers à l'article
+
+Critères de qualité (→ "keep" si OK) :
+- Reste fidèle au sujet de l'article original
+- Intègre correctement les corrections issues de la FAQ
+- Préserve les images [IMAGE_N] existantes
+- Ton cohérent avec le style Circle (tutoriel, guide)
+
+Verdicts :
+- "keep" : réécriture correcte, à conserver telle quelle
+- "regenerate" : dérives mineures corrigibles, à régénérer avec des instructions précises
+- "skip" : dérive majeure, mapping probablement incorrect, abandonner cette réécriture
+
+FORMAT JSON strict, pas de prose, pas de backticks :
+{
+  "verdict": "keep" | "regenerate" | "skip",
+  "severity": "ok" | "minor" | "major",
+  "issues": ["Problème concret 1", "Problème concret 2"],
+  "regeneration_hint": "Instructions précises pour régénérer correctement, ou chaîne vide si verdict != regenerate"
+}`;
+
 const NEW_ARTICLE_SYSTEM = `Tu es un expert en documentation produit pour AirSaas / PRC (SaaS B2B de gestion de projets).
 
 Tu reçois un thème de la FAQ officielle (avec toutes ses questions et réponses) qui n'a AUCUN article correspondant dans la base de connaissances Circle.
@@ -103,6 +160,19 @@ interface ArticleMapping {
 interface ArticleAuditOutput {
   summary_changes: string[];
   rewritten_article_md: string;
+}
+
+interface FilterOutput {
+  verdict: "relevant" | "off_topic";
+  reason: string;
+  best_theme: string | null;
+}
+
+interface ReviewOutput {
+  verdict: "keep" | "regenerate" | "skip";
+  severity: "ok" | "minor" | "major";
+  issues: string[];
+  regeneration_hint: string;
 }
 
 interface NewArticleOutput {
@@ -187,10 +257,12 @@ export const auditCircleVsFaq = task({
       const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
       // ──────────────────────────────────────────
-      // 3. Partie A — audit covered articles
+      // 3. Partie A — audit covered articles (filter → rewrite → review)
       // ──────────────────────────────────────────
       let auditedCount = 0;
       let noChangeCount = 0;
+      let offTopicCount = 0;
+      let regeneratedCount = 0;
 
       for (let i = 0; i < coveredArticles.length; i++) {
         const { post, themes } = coveredArticles[i];
@@ -203,7 +275,55 @@ export const auditCircleVsFaq = task({
         const faqSections = buildFaqSectionsForThemes(themes, faq);
         const commentsText = formatComments(post.comments);
 
-        const userPrompt = `## ARTICLE À AUDITER
+        // ---- Pass 1: upstream filter (reject off-topic mappings) ----
+        const filterPrompt = `## ARTICLE CIRCLE
+
+**Titre :** ${post.name}
+**Espace :** ${post.space_slug}
+
+### Extrait du contenu (premiers 1500 caractères)
+${articleMd.slice(0, 1500)}
+
+---
+
+## THÈMES FAQ ASSOCIÉS PAR LE MAPPING
+
+${themes.map((t) => `- ${t}`).join("\n")}`;
+
+        const filterRaw = await callOpus(
+          client,
+          OPUS_MODEL,
+          MAPPING_FILTER_SYSTEM,
+          filterPrompt,
+          MAX_TOKENS_FILTER,
+          TEMPERATURE
+        );
+        const filterResult = filterRaw ? tryParseJson<FilterOutput>(filterRaw) : null;
+
+        if (filterResult?.verdict === "off_topic") {
+          offTopicCount++;
+          logger.info(`  ⏭  off_topic: ${filterResult.reason}`);
+          await insertAuditItem({
+            audit_run_id: auditRunId,
+            article_url: post.url,
+            article_name: post.name,
+            audit_type: "off_topic",
+            analysis: JSON.stringify({
+              themes_matched: themes,
+              filter_reason: filterResult.reason,
+              best_theme: filterResult.best_theme,
+              original_article_md: articleMd,
+              space_slug: post.space_slug,
+              rejected_at: "filter",
+            }),
+            image_mapping: imageMapping,
+            status: "done",
+          });
+          continue;
+        }
+
+        // ---- Pass 2: rewrite ----
+        const rewritePrompt = `## ARTICLE À AUDITER
 
 **Titre :** ${post.name}
 **URL :** ${post.url}
@@ -219,59 +339,112 @@ ${commentsText ? `\n### Commentaires sur l'article (${post.comments_count})\n${c
 
 ${faqSections}`;
 
-        const raw = await callOpus(
-          client,
-          OPUS_MODEL,
-          ARTICLE_AUDIT_SYSTEM,
-          userPrompt,
-          MAX_TOKENS_PER_ARTICLE,
-          TEMPERATURE
-        );
-
-        if (!raw) {
+        let rewriteParsed = await generateRewrite(client, rewritePrompt);
+        if (!rewriteParsed) {
           errors.push({
             label: post.name,
             inserted: 0,
             skipped: 0,
-            errors: [{ type: "Opus", code: "AUDIT_FAIL", message: `Article audit failed: ${post.url}` }],
+            errors: [{ type: "Opus", code: "REWRITE_FAIL", message: `Article rewrite failed: ${post.url}` }],
           });
           continue;
         }
 
-        const parsed = tryParseJson<ArticleAuditOutput>(raw);
-        if (!parsed) {
-          errors.push({
-            label: post.name,
-            inserted: 0,
-            skipped: 0,
-            errors: [{ type: "Opus", code: "PARSE_FAIL", message: `Could not parse JSON for ${post.url}` }],
-          });
-          continue;
-        }
+        const hasChanges = rewriteParsed.summary_changes.length > 0 && rewriteParsed.rewritten_article_md.trim().length > 0;
 
-        const hasChanges = parsed.summary_changes.length > 0 && parsed.rewritten_article_md.trim().length > 0;
+        // No changes proposed — skip review, store as no_change
         if (!hasChanges) {
           noChangeCount++;
+          await insertAuditItem({
+            audit_run_id: auditRunId,
+            article_url: post.url,
+            article_name: post.name,
+            audit_type: "no_change",
+            analysis: JSON.stringify({
+              themes_matched: themes,
+              summary_changes: rewriteParsed.summary_changes,
+              original_article_md: articleMd,
+              rewritten_article_md: rewriteParsed.rewritten_article_md,
+              space_slug: post.space_slug,
+            }),
+            image_mapping: imageMapping,
+            status: "done",
+          });
+          continue;
         }
 
+        // ---- Pass 3: review (self-critique), with 1 regeneration retry ----
+        let finalRewrite = rewriteParsed;
+        let reviewResult = await reviewRewrite(client, post.name, themes, articleMd, rewriteParsed.rewritten_article_md);
+        let regenerated = false;
+
+        if (reviewResult?.verdict === "regenerate") {
+          regeneratedCount++;
+          logger.info(`  🔁 regenerate: ${reviewResult.issues.join("; ")}`);
+          const retryPrompt = `${rewritePrompt}
+
+---
+
+## RETOUR DU RELECTEUR SUR LA 1ÈRE VERSION (à corriger)
+${reviewResult.issues.map((x) => `- ${x}`).join("\n")}
+
+Instructions précises : ${reviewResult.regeneration_hint}`;
+          const retry = await generateRewrite(client, retryPrompt);
+          if (retry) {
+            finalRewrite = retry;
+            regenerated = true;
+            reviewResult = await reviewRewrite(client, post.name, themes, articleMd, retry.rewritten_article_md);
+          }
+        }
+
+        // After (possibly) regenerating, if review still says skip/regenerate → mark off_topic
+        if (reviewResult?.verdict === "skip" || reviewResult?.verdict === "regenerate") {
+          offTopicCount++;
+          logger.info(`  ⚠️  review_rejected: ${reviewResult.issues.join("; ")}`);
+          await insertAuditItem({
+            audit_run_id: auditRunId,
+            article_url: post.url,
+            article_name: post.name,
+            audit_type: "off_topic",
+            analysis: JSON.stringify({
+              themes_matched: themes,
+              filter_reason: reviewResult.issues.join("; "),
+              original_article_md: articleMd,
+              rejected_rewrite_md: finalRewrite.rewritten_article_md,
+              space_slug: post.space_slug,
+              rejected_at: "review",
+              regeneration_attempted: regenerated,
+              review_severity: reviewResult.severity,
+            }),
+            image_mapping: imageMapping,
+            status: "done",
+          });
+          continue;
+        }
+
+        // Review OK (keep) or review call failed — store as update_needed
         await insertAuditItem({
           audit_run_id: auditRunId,
           article_url: post.url,
           article_name: post.name,
-          audit_type: hasChanges ? "update_needed" : "no_change",
+          audit_type: "update_needed",
           analysis: JSON.stringify({
             themes_matched: themes,
-            summary_changes: parsed.summary_changes,
+            summary_changes: finalRewrite.summary_changes,
             original_article_md: articleMd,
-            rewritten_article_md: parsed.rewritten_article_md,
+            rewritten_article_md: finalRewrite.rewritten_article_md,
             space_slug: post.space_slug,
+            review: reviewResult ?? null,
+            regenerated,
           }),
           image_mapping: imageMapping,
           status: "done",
         });
       }
 
-      logger.info(`Partie A done: ${auditedCount} audited (${noChangeCount} no-change)`);
+      logger.info(
+        `Partie A done: ${auditedCount} audited (${noChangeCount} no-change, ${offTopicCount} off-topic, ${regeneratedCount} regenerated)`
+      );
 
       // ──────────────────────────────────────────
       // 4. Partie B — new article drafts for uncovered themes
@@ -357,6 +530,7 @@ ${themeContent}`;
       const allItems = await getAuditItemsByRunId(auditRunId);
       const updateItems = allItems.filter((i) => i.audit_type === "update_needed");
       const noChangeItems = allItems.filter((i) => i.audit_type === "no_change");
+      const offTopicItems = allItems.filter((i) => i.audit_type === "off_topic");
       const newItems = allItems.filter((i) => i.audit_type === "new_article");
 
       const markdown = buildReportMarkdown({
@@ -365,6 +539,7 @@ ${themeContent}`;
         totalThemes: faq.themes.length,
         updateItems,
         noChangeItems,
+        offTopicItems,
         newItems,
         skippedArticles: skippedArticles.map((s) => s.post),
       });
@@ -374,9 +549,11 @@ ${themeContent}`;
       const stats = {
         faq_version: faqApproved.version,
         total_circle_posts: allPosts.length,
-        articles_audited: updateItems.length + noChangeItems.length,
+        articles_audited: updateItems.length + noChangeItems.length + offTopicItems.length,
         articles_with_changes: updateItems.length,
         articles_no_change: noChangeItems.length,
+        articles_off_topic: offTopicItems.length,
+        articles_regenerated: regeneratedCount,
         articles_skipped: skippedArticles.length,
         new_articles_suggested: newItems.length,
         total_faq_themes: faq.themes.length,
@@ -512,6 +689,7 @@ function buildReportMarkdown(input: {
   totalThemes: number;
   updateItems: AuditItemRow[];
   noChangeItems: AuditItemRow[];
+  offTopicItems: AuditItemRow[];
   newItems: AuditItemRow[];
   skippedArticles: CirclePostForAudit[];
 }): string {
@@ -522,6 +700,7 @@ function buildReportMarkdown(input: {
     totalThemes,
     updateItems,
     noChangeItems,
+    offTopicItems,
     newItems,
     skippedArticles,
   } = input;
@@ -535,7 +714,8 @@ function buildReportMarkdown(input: {
   md += `1. [Articles à mettre à jour](#articles-a-mettre-a-jour) (${updateItems.length})\n`;
   md += `2. [Nouveaux articles proposés](#nouveaux-articles-proposes) (${newItems.length})\n`;
   md += `3. [Articles déjà alignés avec la FAQ](#articles-deja-alignes) (${noChangeItems.length})\n`;
-  md += `4. [Articles non couverts par la FAQ](#articles-non-couverts) (${skippedArticles.length})\n\n`;
+  md += `4. [Articles rejetés par l'audit IA](#articles-rejetes) (${offTopicItems.length})\n`;
+  md += `5. [Articles non couverts par la FAQ](#articles-non-couverts) (${skippedArticles.length})\n\n`;
   md += `---\n\n`;
 
   // Section 1
@@ -613,7 +793,40 @@ function buildReportMarkdown(input: {
   }
   md += `\n`;
 
-  // Section 4
+  // Section 4 — articles rejected by filter or review
+  md += `## Articles rejetés par l'audit IA\n\n`;
+  md += `> ${offTopicItems.length} articles dont le mapping lexical a été invalidé par l'audit IA (hors-sujet au filtre, ou dérive détectée par le relecteur).\n\n`;
+  if (offTopicItems.length === 0) {
+    md += `_(aucun article rejeté)_\n\n`;
+  } else {
+    for (const item of offTopicItems) {
+      const data = tryParseJson<{
+        themes_matched: string[];
+        filter_reason: string;
+        best_theme: string | null;
+        space_slug: string;
+        rejected_at: string;
+        regeneration_attempted?: boolean;
+        review_severity?: string;
+      }>(item.analysis);
+
+      md += `### 🚫 ${item.article_name}\n\n`;
+      md += `**URL :** ${item.article_url}\n`;
+      md += `**Espace :** ${data?.space_slug ?? "—"}\n`;
+      md += `**Thèmes mappés (rejetés) :** ${data?.themes_matched?.join(", ") ?? "—"}\n`;
+      md += `**Rejeté à :** ${data?.rejected_at === "filter" ? "filtre amont" : "relecture post-réécriture"}\n`;
+      if (data?.review_severity) {
+        md += `**Sévérité :** ${data.review_severity}\n`;
+      }
+      if (data?.regeneration_attempted) {
+        md += `**Régénération tentée :** oui (sans succès)\n`;
+      }
+      md += `**Raison :** ${data?.filter_reason ?? "—"}\n\n`;
+      md += `---\n\n`;
+    }
+  }
+
+  // Section 5
   md += `## Articles non couverts\n\n`;
   md += `> ${skippedArticles.length} articles Circle dont le sujet n'a aucun recouvrement avec la FAQ — skippés (rien à proposer).\n\n`;
   for (const p of skippedArticles) {
@@ -626,6 +839,44 @@ function buildReportMarkdown(input: {
 // ============================================
 // HELPERS
 // ============================================
+
+async function generateRewrite(client: Anthropic, userPrompt: string): Promise<ArticleAuditOutput | null> {
+  const raw = await callOpus(
+    client,
+    OPUS_MODEL,
+    ARTICLE_AUDIT_SYSTEM,
+    userPrompt,
+    MAX_TOKENS_PER_ARTICLE,
+    TEMPERATURE
+  );
+  if (!raw) return null;
+  return tryParseJson<ArticleAuditOutput>(raw);
+}
+
+async function reviewRewrite(
+  client: Anthropic,
+  articleName: string,
+  themes: string[],
+  originalMd: string,
+  rewrittenMd: string
+): Promise<ReviewOutput | null> {
+  const prompt = `## ARTICLE ORIGINAL
+
+**Titre :** ${articleName}
+**Thèmes FAQ ciblés :** ${themes.join(", ")}
+
+${originalMd}
+
+---
+
+## RÉÉCRITURE PROPOSÉE
+
+${rewrittenMd}`;
+
+  const raw = await callOpus(client, OPUS_MODEL, REVIEW_SYSTEM, prompt, MAX_TOKENS_REVIEW, TEMPERATURE);
+  if (!raw) return null;
+  return tryParseJson<ReviewOutput>(raw);
+}
 
 function tryParseJson<T>(raw: string): T | null {
   let text = raw.trim();
@@ -676,6 +927,7 @@ async function sendSuccessSlack(
 📊 Résultats
 • Articles à modifier: ${stats.articles_with_changes}
 • Articles déjà alignés: ${stats.articles_no_change}
+• Articles rejetés par l'audit IA: ${stats.articles_off_topic} (dont ${stats.articles_regenerated} régénérés)
 • Articles skippés (non couverts): ${stats.articles_skipped}
 • Nouveaux articles proposés: ${stats.new_articles_suggested}
 • FAQ référence: v${stats.faq_version} (${stats.total_faq_themes} thèmes, ${stats.uncovered_themes} sans article)
