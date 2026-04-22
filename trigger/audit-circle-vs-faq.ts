@@ -41,18 +41,30 @@ Tu reçois :
 
 La FAQ est la SOURCE DE VÉRITÉ. Si l'article dit quelque chose qui diffère de la FAQ, c'est l'article qui a tort.
 
-Ta mission : auditer l'article par rapport à la FAQ et produire une version corrigée.
+Ta mission : auditer l'article par rapport à la FAQ et produire une version corrigée UNIQUEMENT si une réécriture est justifiée.
 
-RÈGLES DE RÉÉCRITURE :
-- Conserve TOUTES les images existantes [IMAGE_N] à leur position logique (ou repositionne-les si le texte autour change)
-- Ne supprime JAMAIS une image existante
-- Si un nouveau passage mériterait une illustration, ajoute [NOUVELLE_IMAGE: description]
-- Garde le ton et le style de l'article original
-- Intègre les informations manquantes identifiées via la FAQ
-- Corrige les incohérences factuelles
-- Pas de nom de client ou d'entreprise cliente
-- Écris en français
-- Sois factuel et actionnable
+RÈGLE ABSOLUE — NE RIEN INVENTER :
+- Tu ne peux affirmer QUE ce qui est présent dans l'article original OU dans la FAQ fournie.
+- Interdit d'inventer des fonctionnalités, des chiffres, des étapes, des intégrations, des évolutions, des cas d'usage.
+- Interdit d'extrapoler à partir du titre ou des thèmes : si l'info n'existe ni dans l'article ni dans la FAQ, elle n'existe pas.
+
+QUAND NE RIEN RÉÉCRIRE (→ renvoie summary_changes: [] et rewritten_article_md: "") :
+- L'article est une annonce produit courte (nouvelle fonctionnalité, teaser, changelog) sans contenu documentaire à corriger.
+- L'article est déjà factuellement aligné avec la FAQ (pas de contradiction, pas de trou de documentation comblable AVEC la FAQ fournie).
+- Le sujet réel de l'article est tangent aux thèmes FAQ : les points communs sont lexicaux mais pas substantiels.
+- La seule réécriture possible serait d'ajouter du contenu inventé pour "enrichir".
+
+QUAND RÉÉCRIRE (→ summary_changes non vide) :
+- L'article contient une erreur factuelle que la FAQ corrige.
+- L'article omet une information CRITIQUE présente dans la FAQ, qui s'inscrit naturellement dans son sujet et sa longueur.
+- Une incohérence ou ambiguïté peut être levée via la FAQ.
+
+RÈGLES DE RÉÉCRITURE (quand elle est justifiée) :
+- Conserve TOUTES les images [IMAGE_N] existantes à leur position logique. Ne supprime JAMAIS une image.
+- Si un nouveau passage mériterait une illustration, ajoute [NOUVELLE_IMAGE: description].
+- Garde le ton, le style ET la LONGUEUR de l'article original (±30% max). Ne transforme pas une annonce en guide complet.
+- Reste dans le périmètre du sujet original : n'élargis pas à des fonctionnalités voisines.
+- Pas de nom de client ou d'entreprise cliente. Écris en français. Sois factuel et actionnable.
 
 FORMAT DE SORTIE — JSON strict, pas de prose, pas de backticks :
 {
@@ -64,7 +76,7 @@ FORMAT DE SORTIE — JSON strict, pas de prose, pas de backticks :
   "rewritten_article_md": "L'article complet réécrit en markdown, avec [IMAGE_N] à leur place."
 }
 
-Si après analyse l'article est parfaitement aligné avec la FAQ et qu'aucune modification n'est justifiée, réponds :
+Si aucune réécriture n'est justifiée (voir QUAND NE RIEN RÉÉCRIRE), réponds :
 {
   "summary_changes": [],
   "rewritten_article_md": ""
