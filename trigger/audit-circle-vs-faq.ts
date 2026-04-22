@@ -265,12 +265,23 @@ export const auditCircleVsFaq = task({
 
       const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-      // Resume: build set of URLs already done for this run_id
+      // Resume: build set of URLs already done for this run_id,
+      // et reconstruire la couverture post-filtre depuis les items existants.
       const alreadyDone = new Set<string>();
+      const postFilterCoveredThemes = new Set<string>();
       if (resuming) {
         const existing = await getAuditItemsByRunId(auditRunId);
         for (const item of existing) {
           if (item.article_url) alreadyDone.add(item.article_url);
+          if (item.audit_type === "update_needed" || item.audit_type === "no_change") {
+            try {
+              const analysis = JSON.parse(item.analysis || "{}");
+              const themes: string[] = analysis.themes_matched || [];
+              for (const t of themes) postFilterCoveredThemes.add(t);
+            } catch {
+              // ignore malformed analysis JSON
+            }
+          }
         }
         logger.info(`Resume: ${alreadyDone.size} items already done for runId=${auditRunId}`);
       }
@@ -381,6 +392,7 @@ ${faqSections}`;
         // No changes proposed — skip review, store as no_change
         if (!hasChanges) {
           noChangeCount++;
+          for (const t of themes) postFilterCoveredThemes.add(t);
           await insertAuditItem({
             audit_run_id: auditRunId,
             article_url: post.url,
@@ -449,6 +461,7 @@ Instructions précises : ${reviewResult.regeneration_hint}`;
         }
 
         // Review OK (keep) or review call failed — store as update_needed
+        for (const t of themes) postFilterCoveredThemes.add(t);
         await insertAuditItem({
           audit_run_id: auditRunId,
           article_url: post.url,
@@ -473,11 +486,20 @@ Instructions précises : ${reviewResult.regeneration_hint}`;
       );
 
       // ──────────────────────────────────────────
-      // 4. Partie B — new article drafts for uncovered themes
+      // 4. Partie B — brouillons pour thèmes sans article retenu (post-filtre)
       // ──────────────────────────────────────────
+      // Un thème est "vraiment couvert" uniquement s'il a au moins un article
+      // retenu (update_needed ou no_change). Les thèmes dont tous les articles
+      // ont été rejetés (off_topic) sont considérés comme uncovered et
+      // déclenchent un brouillon d'article.
+      const realUncoveredThemes = faq.themes.filter((t) => !postFilterCoveredThemes.has(t));
+      logger.info(
+        `Post-filter coverage: ${postFilterCoveredThemes.size}/${faq.themes.length} thèmes avec ≥1 article retenu. ${realUncoveredThemes.length} thèmes uncovered (lexical: ${uncoveredThemes.length}).`
+      );
+
       let newArticleCount = 0;
 
-      for (const theme of uncoveredThemes) {
+      for (const theme of realUncoveredThemes) {
         const questions = faq.sectionsByTheme[theme] || [];
         if (questions.length === 0) continue;
 
@@ -489,7 +511,7 @@ Instructions précises : ${reviewResult.regeneration_hint}`;
 
         newArticleCount++;
         logger.info(
-          `[Partie B ${newArticleCount}/${uncoveredThemes.length}] Theme without Circle article: "${theme}" (${questions.length} questions)`
+          `[Partie B ${newArticleCount}/${realUncoveredThemes.length}] Theme without kept article: "${theme}" (${questions.length} questions)`
         );
 
         const themeContent = questions
@@ -589,7 +611,8 @@ ${themeContent}`;
         articles_skipped: skippedArticles.length,
         new_articles_suggested: newItems.length,
         total_faq_themes: faq.themes.length,
-        uncovered_themes: uncoveredThemes.length,
+        uncovered_themes: realUncoveredThemes.length,
+        uncovered_themes_lexical: uncoveredThemes.length,
       };
       const docMeta = {
         audit_run_id: auditRunId,
