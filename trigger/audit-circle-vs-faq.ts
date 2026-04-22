@@ -203,7 +203,7 @@ export const auditCircleVsFaq = task({
       // ──────────────────────────────────────────
       // 1. Load FAQ + Circle posts
       // ──────────────────────────────────────────
-      const [faqApproved, allPosts] = await Promise.all([
+      const [faqApproved, allPostsRaw] = await Promise.all([
         getFaqApproved(),
         getAllCirclePosts(),
       ]);
@@ -215,9 +215,15 @@ export const auditCircleVsFaq = task({
         return { error: msg };
       }
 
+      // Exclure l'espace "utilisateurs-d-airsaas" : contenu communautaire,
+      // pas de la doc officielle (on ne l'audite pas ni ne le réécrit).
+      const EXCLUDED_SPACES = new Set(["utilisateurs-d-airsaas"]);
+      const allPosts = allPostsRaw.filter((p) => !EXCLUDED_SPACES.has(p.space_slug));
+      const excludedCount = allPostsRaw.length - allPosts.length;
+
       const faq = parseFaq(faqApproved.markdown);
       logger.info(
-        `FAQ v${faqApproved.version}: ${faq.themes.length} themes, ${Object.keys(faq.sectionsByTitle).length} questions. Circle posts: ${allPosts.length} published.`
+        `FAQ v${faqApproved.version}: ${faq.themes.length} themes, ${Object.keys(faq.sectionsByTitle).length} questions. Circle posts: ${allPosts.length} published (${excludedCount} exclus: ${[...EXCLUDED_SPACES].join(", ")}).`
       );
 
       // ──────────────────────────────────────────
