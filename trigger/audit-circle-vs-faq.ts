@@ -194,6 +194,42 @@ interface NewArticleOutput {
 }
 
 // ============================================
+// HELPERS
+// ============================================
+
+/**
+ * Multiset word-overlap ratio between two markdown strings, after typographic
+ * + whitespace normalization. Used to detect ghost changes: when Opus declares
+ * `summary_changes` but the rewritten markdown is essentially identical to
+ * the original, force `audit_type=no_change` instead of running Passe 3.
+ */
+function wordSimilarity(a: string, b: string): number {
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[’‘“”—–  …]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const aTokens = norm(a).match(/\S+/g) || [];
+  const bTokens = norm(b).match(/\S+/g) || [];
+  if (aTokens.length === 0 && bTokens.length === 0) return 1;
+  const aCounts = new Map<string, number>();
+  for (const t of aTokens) aCounts.set(t, (aCounts.get(t) || 0) + 1);
+  let common = 0;
+  for (const t of bTokens) {
+    const c = aCounts.get(t) || 0;
+    if (c > 0) {
+      common++;
+      aCounts.set(t, c - 1);
+    }
+  }
+  const maxLen = Math.max(aTokens.length, bTokens.length);
+  return maxLen > 0 ? common / maxLen : 1;
+}
+
+const GHOST_CHANGE_THRESHOLD = 0.95;
+
+// ============================================
 // TASK
 // ============================================
 
@@ -399,7 +435,20 @@ ${faqSections}`;
           continue;
         }
 
-        const hasChanges = rewriteParsed.summary_changes.length > 0 && rewriteParsed.rewritten_article_md.trim().length > 0;
+        let hasChanges = rewriteParsed.summary_changes.length > 0 && rewriteParsed.rewritten_article_md.trim().length > 0;
+
+        // Anti-ghost-change: if rewrite is ≥95% identical to original (after
+        // typographic + whitespace normalization), Opus declared phantom
+        // changes — treat as no_change and skip review.
+        if (hasChanges) {
+          const sim = wordSimilarity(articleMd, rewriteParsed.rewritten_article_md);
+          if (sim >= GHOST_CHANGE_THRESHOLD) {
+            logger.info(
+              `[Ghost change] "${post.name}" — rewrite ${(sim * 100).toFixed(1)}% identical to original, forcing no_change.`
+            );
+            hasChanges = false;
+          }
+        }
 
         // No changes proposed — skip review, store as no_change
         if (!hasChanges) {
