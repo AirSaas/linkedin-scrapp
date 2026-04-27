@@ -95,7 +95,8 @@ TYPO_NORMALIZE = str.maketrans({
 
 
 def normalize(text):
-    return text.translate(TYPO_NORMALIZE)
+    text = text.translate(TYPO_NORMALIZE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def tokenize(text):
@@ -284,10 +285,11 @@ def render_markdown(doc, md, diffs):
             i += 1
             continue
 
-        if re.match(r"^\s*\d+\.\s+", line):
-            content = re.sub(r"^\s*\d+\.\s+", "", line)
-            p = doc.add_paragraph(style="List Number")
-            add_inline_runs(p, content)
+        m = re.match(r"^\s*(\d+)\.\s+(.*)$", line)
+        if m:
+            p = doc.add_paragraph()
+            p.add_run(f"{m.group(1)}. ")
+            add_inline_runs(p, m.group(2))
             i += 1
             continue
 
@@ -311,8 +313,9 @@ def main():
         md = f.read()
 
     doc = Document()
-    style = doc.styles["Normal"]
-    style.font.size = Pt(11)
+    doc.styles["Normal"].font.size = Pt(13)
+    for name, size in (("Heading 1", 22), ("Heading 2", 18), ("Heading 3", 15), ("Heading 4", 13)):
+        doc.styles[name].font.size = Pt(size)
 
     render_markdown(doc, md, diffs)
     doc.save(OUTPUT_DOCX)
